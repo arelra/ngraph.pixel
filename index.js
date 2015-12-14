@@ -248,11 +248,6 @@ function pixel(graph, options) {
 
     scene.add(camera);
 
-    // TODO make this configurable to swap in different controls
-    cameraControls = new orbitControls(camera);
-    cameraControls.autoRotate = true;
-    cameraControls.zoomSpeed = 1;
-
     nodeView = createNodeView(scene);
     edgeView = createEdgeView(scene);
 
@@ -271,6 +266,11 @@ function pixel(graph, options) {
     input.on('nodeover', setTooltip);
     input.on('nodeclick', passthrough('nodeclick'));
     input.on('nodedblclick', passthrough('nodedblclick'));
+
+    // TODO make this configurable to swap in different controls
+    cameraControls = new orbitControls(camera, document.getElementsByTagName('canvas')[0]);
+    cameraControls.autoRotate = true;
+    cameraControls.zoomSpeed = 1;
 
     window.addEventListener('resize', onWindowResize, false);
   }
