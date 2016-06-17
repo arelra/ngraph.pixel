@@ -1,6 +1,15 @@
-module.exports = pixel;
 var THREE = require('three');
+
+module.exports = pixel;
+
+/**
+ * Expose to the outter world instance of three.js
+ * so that they can use it if they need it
+ */
+module.exports.THREE = THREE;
+
 var eventify = require('ngraph.events');
+
 var createNodeView = require('./lib/nodeView.js');
 var createEdgeView = require('./lib/edgeView.js');
 var createTooltipView = require('./lib/tooltip.js');
@@ -8,46 +17,13 @@ var createAutoFit = require('./lib/autoFit.js');
 var createInput = require('./lib/input.js');
 var validateOptions = require('./options.js');
 var flyTo = require('./lib/flyTo.js');
-var orbitControls = require('three-orbit-controls')(THREE)
+// var orbitControls = require('three-orbit-controls')(THREE)
+
+var makeActive = require('./lib/makeActive.js');
 
 function pixel(graph, options) {
   // This is our public API.
   var api = {
-    /**
-     * Set or get size of a node
-     *
-     * @param {string} nodeId identifier of a node in question
-     * @param {number+} size if undefined, then current node size is returned;
-     * Otherwise the new value is set.
-     */
-    nodeSize: nodeSize,
-
-    /**
-     * Set or get color of a node
-     *
-     * @param {string} nodeId identifier of a node in question
-     * @param {number+|Array} color rgb color hex code. If not specified, then current
-     * node color is returned. Otherwise the new color is assigned to the node.
-     * This value can also be an array of three arguments, in that case each element
-     * of the array is considered to be [r, g, b]
-     */
-    nodeColor: nodeColor,
-
-    /**
-     * Gets or sets color of a link
-     *
-     * @param {string|function} linkId identifier of a link.
-     * - If this argument is the only argument, then color of the link
-     *   { from: hexColor, to: hexColor } is returned.
-     * - If this argument is a function, then the it will be used as iterator
-     *   callback to get each link color. The only argument to this function is
-     *   `link` object. Expected output is { from: hexColor, to: hexColor }
-     * @param {number} fromColorHex - rgb color hex code of a link start
-     * @param {number+} toColorHex - rgb color hex code of theh link end. If not
-     * specified the same value as `fromColorHex` is used.
-     */
-    linkColor: linkColor,
-
     /**
      * attempts to fit graph into available screen size
      */
@@ -118,7 +94,44 @@ function pixel(graph, options) {
      * @param {number+} color if specified, then new color is set. Otherwise
      * returns current clear color.
      */
-    background: clearColor
+    background: clearColor,
+
+    /**
+     * Gets UI for a given node id. If node creation function decided not to
+     * return UI for this node, falsy object is returned.
+     *
+     * @param {string} nodeId - identifier of the node
+     * @returns Object that represents UI for the node
+     */
+    getNode: getNode,
+
+    /**
+     * Gets UI for a given link id. If link creation function decided not to
+     * return UI for this link, falsy object is returned.
+     *
+     * @param {string} linkId - identifier of the link
+     * @returns Object that represents UI for the link
+     */
+    getLink: getLink,
+
+    /**
+     * Iterates over every link UI element
+     *
+     * @param {Function} cb - link visitor. Accepts one argument, which is linkUI
+     */
+    forEachLink: forEachLink,
+
+    /**
+     * Iterates over every node UI element
+     *
+     * @param {Function} cb - node visitor. Accepts one argument, which is nodeUI
+     */
+    forEachNode: forEachNode,
+
+    /**
+     * Gets three.js scene where current graph is rendered
+     */
+    scene: getScene
   };
 
   eventify(api);
@@ -127,21 +140,22 @@ function pixel(graph, options) {
 
   var beforeFrameCallback;
   var container = options.container;
+  verifyContainerDimensions(container);
+
   var layout = options.createLayout(graph, options);
   if (layout && typeof layout.on === 'function') {
     layout.on('reset', layoutReset);
   }
   var isStable = false;
-  var nodeIdToIdx = Object.create(null);
-  var edgeIdToIdx = Object.create(null);
-  var nodeIdxToId = [];
+  var nodeIdToIdx = new Map();
+  var edgeIdToIndex = new Map();
 
   var scene, camera, renderer;
   var nodeView, edgeView, autoFitController, input;
-  var nodePositions, edgePositions;
+  var nodes, edges;
   var tooltipView = createTooltipView(container);
 
-  var cameraControls;
+  // var cameraControls;
   init();
   run();
   focus();
@@ -172,6 +186,9 @@ function pixel(graph, options) {
     }
     if (!isStable) {
       isStable = layout.step();
+
+      updatePositions();
+
       nodeView.update();
       edgeView.update();
     } else {
@@ -183,14 +200,20 @@ function pixel(graph, options) {
 
     if (isStable) api.fire('stable', true);
 
+    input.update();
+
     if (autoFitController) {
       autoFitController.update();
       input.adjustSpeed(autoFitController.lastRadius());
     }
 
-    cameraControls.update();
+    // cameraControls.update();
 
     renderer.render(scene, camera);
+  }
+
+  function getScene() {
+    return scene;
   }
 
   function beforeFrame(newBeforeFrameCallback) {
@@ -204,36 +227,67 @@ function pixel(graph, options) {
   }
 
   function listenToGraph() {
-    // TODO: this is not efficient at all. We are recriating view from scratch on
+    // TODO: this is not efficient at all. We are recreating view from scratch on
     // every single change.
     graph.on('changed', initPositions);
   }
 
+  function updatePositions() {
+    if (!nodes) return;
+
+    for (var i = 0; i < nodes.length; ++i) {
+      var node = nodes[i];
+      node.position = layout.getNodePosition(node.id);
+    }
+  }
+
   function initPositions() {
-    var idx = 0;
-    edgePositions = [];
-    nodePositions = [];
+    edges = [];
+    nodes = [];
+    nodeIdToIdx = new Map();
+    edgeIdToIndex = new Map();
     graph.forEachNode(addNodePosition);
     graph.forEachLink(addEdgePosition);
 
-    nodeView.initPositions(nodePositions);
-    edgeView.initPositions(edgePositions);
+    nodeView.init(nodes);
+    edgeView.init(edges);
 
     if (input) input.reset();
 
     function addNodePosition(node) {
+      var nodeModel = options.node(node);
+      if (!nodeModel) return;
+      var idx = nodes.length;
+
       var position = layout.getNodePosition(node.id);
       if (typeof position.z !== 'number') position.z = 0;
-      nodePositions.push(position);
-      nodeIdToIdx[node.id] = idx;
-      nodeIdxToId[idx] = node.id;
-      idx += 1;
+
+      nodeModel.id = node.id;
+      nodeModel.position = position;
+      nodeModel.idx = idx;
+
+      nodes.push(makeActive(nodeModel));
+
+      nodeIdToIdx.set(node.id, idx);
     }
 
     function addEdgePosition(edge) {
-      var edgeOffset = edgePositions.length;
-      edgeIdToIdx[edge.id] = edgeOffset;
-      edgePositions.push(nodePositions[nodeIdToIdx[edge.fromId]], nodePositions[nodeIdToIdx[edge.toId]]);
+      var edgeModel = options.link(edge);
+      if (!edgeModel) return;
+
+      var fromNode = nodes[nodeIdToIdx.get(edge.fromId)];
+      if (!fromNode) return; // cant have an edge that doesn't have a node
+
+      var toNode = nodes[nodeIdToIdx.get(edge.toId)];
+      if (!toNode) return;
+
+      edgeModel.idx = edges.length;
+      edgeModel.from = fromNode;
+      edgeModel.to = toNode;
+
+      edgeIdToIndex.set(edge.id, edgeModel.idx);
+
+      edges.push(makeActive(edgeModel));
     }
   }
 
@@ -268,90 +322,40 @@ function pixel(graph, options) {
     input.on('nodedblclick', passthrough('nodedblclick'));
 
     // TODO make this configurable to swap in different controls
-    cameraControls = new orbitControls(camera, document.getElementsByTagName('canvas')[0]);
-    cameraControls.autoRotate = true;
-    cameraControls.zoomSpeed = 1;
+    // cameraControls = new orbitControls(camera, document.getElementsByTagName('canvas')[0]);
+    // cameraControls.autoRotate = true;
+    // cameraControls.zoomSpeed = 1;
 
     window.addEventListener('resize', onWindowResize, false);
   }
 
-  // TODO: looks like these node/links manipulation should be extracted into
-  // higher level API.
-  function nodeColor(nodeId, color) {
-    if (typeof nodeId === 'function') {
-      graph.forEachNode(getNodeColorFactory(nodeId));
-      return;
-    }
-    var idx = getNodeIdxByNodeId(nodeId);
-    return nodeView.color(idx, normalizeColor(color));
+  function getNode(nodeId) {
+    var idx = nodeIdToIdx.get(nodeId);
+    if (idx === undefined) return;
+
+    return nodes[idx];
   }
 
-  function getNodeColorFactory(setter) {
-    return function(node) {
-      var color = setter(node);
-      nodeColor(node.id, color);
-    };
+  function getLink(linkId) {
+    var idx = edgeIdToIndex.get(linkId);
+    if (idx === undefined) return;
+
+    return edges[idx];
   }
 
-  function nodeSize(nodeId, size) {
-    if (typeof nodeId === 'function') {
-      graph.forEachNode(getNodeSizeFactory(nodeId));
-      return;
-    }
-    var idx = getNodeIdxByNodeId(nodeId);
-    return nodeView.size(idx, size);
+  function forEachLink(cb) {
+    if (typeof cb !== 'function') throw new Error('link visitor should be a function');
+    edges.forEach(cb);
   }
 
-  function getNodeSizeFactory(setter) {
-    return function(node) {
-      var size = setter(node);
-      nodeSize(node.id, size);
-    };
-  }
-
-  function getNodeColorFactory(setter) {
-    return function(node) {
-      var color = setter(node);
-      nodeColor(node.id, color);
-    };
-  }
-
-  function linkColor(linkId, fromColorHex, toColorHex) {
-    if (typeof linkId === 'function') {
-      // This means that user passed a factory function to bulk-set colors of
-      // each link. We should iterate over every link and use result of the function
-      // to set color:
-      graph.forEachLink(getLinkColorFactory(linkId));
-      return;
-    }
-
-    var idx = edgeIdToIdx[linkId];
-    var idxValid = (0 <= idx && idx < edgePositions.length);
-    if (!idxValid) throw new Error('Link index is not valid ' + linkId);
-
-    if (fromColorHex === undefined) return edgeView.color(idx);
-    return edgeView.color(idx, normalizeColor(fromColorHex), normalizeColor(toColorHex));
-  }
-
-  function getLinkColorFactory(setter) {
-    return function(link) {
-      var color = setter(link);
-      linkColor(link.id, color.from, color.to);
-    };
-  }
-
-  function getNodeIdxByNodeId(nodeId) {
-    var idx = nodeIdToIdx[nodeId];
-    if (idx === undefined) throw new Error('Cannot find node with id ' + nodeId);
-    var idxValid = (0 <= idx && idx < graph.getNodesCount());
-    if (!idxValid) throw new Error('Node index is out of range' + nodeId);
-
-    return idx;
+  function forEachNode(cb) {
+    if (typeof cb !== 'function') throw new Error('node visitor should be a function');
+    nodes.forEach(cb);
   }
 
   function setTooltip(e) {
     var node = getNodeByIndex(e.nodeIndex);
-    if (node) {
+    if (node !== undefined) {
       tooltipView.show(e, node);
     } else {
       tooltipView.hide(e);
@@ -367,7 +371,8 @@ function pixel(graph, options) {
   }
 
   function getNodeByIndex(nodeIndex) {
-    return nodeIndex && graph.getNode(nodeIdxToId[nodeIndex]);
+    var nodeUI = nodes[nodeIndex];
+    return nodeUI && graph.getNode(nodeUI.id);
   }
 
   function stopAutoFit() {
@@ -392,7 +397,7 @@ function pixel(graph, options) {
   }
 
   function stable(stableValue) {
-    if (stableValue === undefined) return isStable;
+    if (stableValue === undefined) return isStable;
     isStable = stableValue;
     api.fire('stable', isStable);
   }
@@ -426,5 +431,15 @@ function pixel(graph, options) {
   function showNode(nodeId, stopDistance) {
     stopDistance = typeof stopDistance === 'number' ? stopDistance : 100;
     flyTo(camera, layout.getNodePosition(nodeId), stopDistance);
+  }
+}
+
+function verifyContainerDimensions(container) {
+  if (!container) {
+    throw new Error('container is required for the renderer');
+  }
+
+  if (container.clientWidth <= 0 || container.clientHeight <= 0) {
+    console.warn('Container is not visible. Make sure to set width/height to see the graph');
   }
 }

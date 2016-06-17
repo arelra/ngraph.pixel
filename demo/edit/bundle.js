@@ -31,7 +31,7 @@ createLegend(settings, 'Groups', [{
 }
 ]);
 
-},{"../../":2,"config.pixel":16,"edgelegend":41,"ngraph.generators":45}],2:[function(require,module,exports){
+},{"../../":2,"config.pixel":17,"edgelegend":19,"ngraph.generators":53}],2:[function(require,module,exports){
 module.exports = pixel;
 var THREE = require('three');
 var eventify = require('ngraph.events');
@@ -43,44 +43,11 @@ var createInput = require('./lib/input.js');
 var validateOptions = require('./options.js');
 var flyTo = require('./lib/flyTo.js');
 
+var makeActive = require('./lib/makeActive.js');
+
 function pixel(graph, options) {
   // This is our public API.
   var api = {
-    /**
-     * Set or get size of a node
-     *
-     * @param {string} nodeId identifier of a node in question
-     * @param {number+} size if undefined, then current node size is returned;
-     * Otherwise the new value is set.
-     */
-    nodeSize: nodeSize,
-
-    /**
-     * Set or get color of a node
-     *
-     * @param {string} nodeId identifier of a node in question
-     * @param {number+|Array} color rgb color hex code. If not specified, then current
-     * node color is returned. Otherwise the new color is assigned to the node.
-     * This value can also be an array of three arguments, in that case each element
-     * of the array is considered to be [r, g, b]
-     */
-    nodeColor: nodeColor,
-
-    /**
-     * Gets or sets color of a link
-     *
-     * @param {string|function} linkId identifier of a link.
-     * - If this argument is the only argument, then color of the link
-     *   { from: hexColor, to: hexColor } is returned.
-     * - If this argument is a function, then the it will be used as iterator
-     *   callback to get each link color. The only argument to this function is
-     *   `link` object. Expected output is { from: hexColor, to: hexColor }
-     * @param {number} fromColorHex - rgb color hex code of a link start
-     * @param {number+} toColorHex - rgb color hex code of theh link end. If not
-     * specified the same value as `fromColorHex` is used.
-     */
-    linkColor: linkColor,
-
     /**
      * attempts to fit graph into available screen size
      */
@@ -151,7 +118,39 @@ function pixel(graph, options) {
      * @param {number+} color if specified, then new color is set. Otherwise
      * returns current clear color.
      */
-    background: clearColor
+    background: clearColor,
+
+    /**
+     * Gets UI for a given node id. If node creation function decided not to
+     * return UI for this node, falsy object is returned.
+     *
+     * @param {string} nodeId - identifier of the node
+     * @returns Object that represents UI for the node
+     */
+    getNode: getNode,
+
+    /**
+     * Gets UI for a given link id. If link creation function decided not to
+     * return UI for this link, falsy object is returned.
+     *
+     * @param {string} linkId - identifier of the link
+     * @returns Object that represents UI for the link
+     */
+    getLink: getLink,
+
+    /**
+     * Iterates over every link UI element
+     *
+     * @param {Function} cb - link visitor. Accepts one argument, which is linkUI
+     */
+    forEachLink: forEachLink,
+
+    /**
+     * Iterates over every node UI element
+     *
+     * @param {Function} cb - node visitor. Accepts one argument, which is nodeUI
+     */
+    forEachNode: forEachNode
   };
 
   eventify(api);
@@ -160,18 +159,19 @@ function pixel(graph, options) {
 
   var beforeFrameCallback;
   var container = options.container;
+  verifyContainerDimensions(container);
+
   var layout = options.createLayout(graph, options);
   if (layout && typeof layout.on === 'function') {
     layout.on('reset', layoutReset);
   }
   var isStable = false;
-  var nodeIdToIdx = Object.create(null);
-  var edgeIdToIdx = Object.create(null);
-  var nodeIdxToId = [];
+  var nodeIdToIdx = new Map();
+  var edgeIdToIndex = new Map();
 
   var scene, camera, renderer;
   var nodeView, edgeView, autoFitController, input;
-  var nodePositions, edgePositions;
+  var nodes, edges;
   var tooltipView = createTooltipView(container);
 
   init();
@@ -204,6 +204,9 @@ function pixel(graph, options) {
     }
     if (!isStable) {
       isStable = layout.step();
+
+      updatePositions();
+
       nodeView.update();
       edgeView.update();
     } else {
@@ -216,6 +219,7 @@ function pixel(graph, options) {
     if (isStable) api.fire('stable', true);
 
     input.update();
+
     if (autoFitController) {
       autoFitController.update();
       input.adjustSpeed(autoFitController.lastRadius());
@@ -234,36 +238,67 @@ function pixel(graph, options) {
   }
 
   function listenToGraph() {
-    // TODO: this is not efficient at all. We are recriating view from scratch on
+    // TODO: this is not efficient at all. We are recreating view from scratch on
     // every single change.
     graph.on('changed', initPositions);
   }
 
+  function updatePositions() {
+    if (!nodes) return;
+
+    for (var i = 0; i < nodes.length; ++i) {
+      var node = nodes[i];
+      node.position = layout.getNodePosition(node.id);
+    }
+  }
+
   function initPositions() {
-    var idx = 0;
-    edgePositions = [];
-    nodePositions = [];
+    edges = [];
+    nodes = [];
+    nodeIdToIdx = new Map();
+    edgeIdToIndex = new Map();
     graph.forEachNode(addNodePosition);
     graph.forEachLink(addEdgePosition);
 
-    nodeView.initPositions(nodePositions);
-    edgeView.initPositions(edgePositions);
+    nodeView.init(nodes);
+    edgeView.init(edges);
 
     if (input) input.reset();
 
     function addNodePosition(node) {
+      var nodeModel = options.node(node);
+      if (!nodeModel) return;
+      var idx = nodes.length;
+
       var position = layout.getNodePosition(node.id);
       if (typeof position.z !== 'number') position.z = 0;
-      nodePositions.push(position);
-      nodeIdToIdx[node.id] = idx;
-      nodeIdxToId[idx] = node.id;
-      idx += 1;
+
+      nodeModel.id = node.id;
+      nodeModel.position = position;
+      nodeModel.idx = idx;
+
+      nodes.push(makeActive(nodeModel));
+
+      nodeIdToIdx.set(node.id, idx);
     }
 
     function addEdgePosition(edge) {
-      var edgeOffset = edgePositions.length;
-      edgeIdToIdx[edge.id] = edgeOffset;
-      edgePositions.push(nodePositions[nodeIdToIdx[edge.fromId]], nodePositions[nodeIdToIdx[edge.toId]]);
+      var edgeModel = options.link(edge);
+      if (!edgeModel) return;
+
+      var fromNode = nodes[nodeIdToIdx.get(edge.fromId)];
+      if (!fromNode) return; // cant have an edge that doesn't have a node
+
+      var toNode = nodes[nodeIdToIdx.get(edge.toId)];
+      if (!toNode) return;
+
+      edgeModel.idx = edges.length;
+      edgeModel.from = fromNode;
+      edgeModel.to = toNode;
+
+      edgeIdToIndex.set(edge.id, edgeModel.idx);
+
+      edges.push(makeActive(edgeModel));
     }
   }
 
@@ -299,83 +334,33 @@ function pixel(graph, options) {
     window.addEventListener('resize', onWindowResize, false);
   }
 
-  // TODO: looks like these node/links manipulation should be extracted into
-  // higher level API.
-  function nodeColor(nodeId, color) {
-    if (typeof nodeId === 'function') {
-      graph.forEachNode(getNodeColorFactory(nodeId));
-      return;
-    }
-    var idx = getNodeIdxByNodeId(nodeId);
-    return nodeView.color(idx, normalizeColor(color));
+  function getNode(nodeId) {
+    var idx = nodeIdToIdx.get(nodeId);
+    if (idx === undefined) return;
+
+    return nodes[idx];
   }
 
-  function getNodeColorFactory(setter) {
-    return function(node) {
-      var color = setter(node);
-      nodeColor(node.id, color);
-    };
+  function getLink(linkId) {
+    var idx = edgeIdToIndex.get(linkId);
+    if (idx === undefined) return;
+
+    return edges[idx];
   }
 
-  function nodeSize(nodeId, size) {
-    if (typeof nodeId === 'function') {
-      graph.forEachNode(getNodeSizeFactory(nodeId));
-      return;
-    }
-    var idx = getNodeIdxByNodeId(nodeId);
-    return nodeView.size(idx, size);
+  function forEachLink(cb) {
+    if (typeof cb !== 'function') throw new Error('link visitor should be a function');
+    edges.forEach(cb);
   }
 
-  function getNodeSizeFactory(setter) {
-    return function(node) {
-      var size = setter(node);
-      nodeSize(node.id, size);
-    };
-  }
-
-  function getNodeColorFactory(setter) {
-    return function(node) {
-      var color = setter(node);
-      nodeColor(node.id, color);
-    };
-  }
-
-  function linkColor(linkId, fromColorHex, toColorHex) {
-    if (typeof linkId === 'function') {
-      // This means that user passed a factory function to bulk-set colors of
-      // each link. We should iterate over every link and use result of the function
-      // to set color:
-      graph.forEachLink(getLinkColorFactory(linkId));
-      return;
-    }
-
-    var idx = edgeIdToIdx[linkId];
-    var idxValid = (0 <= idx && idx < edgePositions.length);
-    if (!idxValid) throw new Error('Link index is not valid ' + linkId);
-
-    if (fromColorHex === undefined) return edgeView.color(idx);
-    return edgeView.color(idx, normalizeColor(fromColorHex), normalizeColor(toColorHex));
-  }
-
-  function getLinkColorFactory(setter) {
-    return function(link) {
-      var color = setter(link);
-      linkColor(link.id, color.from, color.to);
-    };
-  }
-
-  function getNodeIdxByNodeId(nodeId) {
-    var idx = nodeIdToIdx[nodeId];
-    if (idx === undefined) throw new Error('Cannot find node with id ' + nodeId);
-    var idxValid = (0 <= idx && idx < graph.getNodesCount());
-    if (!idxValid) throw new Error('Node index is out of range' + nodeId);
-
-    return idx;
+  function forEachNode(cb) {
+    if (typeof cb !== 'function') throw new Error('node visitor should be a function');
+    nodes.forEach(cb);
   }
 
   function setTooltip(e) {
     var node = getNodeByIndex(e.nodeIndex);
-    if (node) {
+    if (node !== undefined) {
       tooltipView.show(e, node);
     } else {
       tooltipView.hide(e);
@@ -391,7 +376,8 @@ function pixel(graph, options) {
   }
 
   function getNodeByIndex(nodeIndex) {
-    return nodeIndex && graph.getNode(nodeIdxToId[nodeIndex]);
+    var nodeUI = nodes[nodeIndex];
+    return nodeUI && graph.getNode(nodeUI.id);
   }
 
   function stopAutoFit() {
@@ -453,7 +439,17 @@ function pixel(graph, options) {
   }
 }
 
-},{"./lib/autoFit.js":3,"./lib/edgeView.js":6,"./lib/flyTo.js":7,"./lib/input.js":9,"./lib/nodeView.js":13,"./lib/tooltip.js":14,"./options.js":78,"ngraph.events":44,"three":77}],3:[function(require,module,exports){
+function verifyContainerDimensions(container) {
+  if (!container) {
+    throw new Error('container is required for the renderer');
+  }
+
+  if (container.clientWidth <= 0 || container.clientHeight <= 0) {
+    console.warn('Container is not visible. Make sure to set width/height to see the graph');
+  }
+}
+
+},{"./lib/autoFit.js":3,"./lib/edgeView.js":6,"./lib/flyTo.js":7,"./lib/input.js":9,"./lib/makeActive.js":11,"./lib/nodeView.js":14,"./lib/tooltip.js":15,"./options.js":77,"ngraph.events":44,"three":76}],3:[function(require,module,exports){
 var flyTo = require('./flyTo.js');
 module.exports = createAutoFit;
 
@@ -509,27 +505,33 @@ function createParticleMaterial() {
   return material;
 }
 
-},{"./defaultTexture.js":5,"./node-fragment.js":11,"./node-vertex.js":12,"three":77}],5:[function(require,module,exports){
+},{"./defaultTexture.js":5,"./node-fragment.js":12,"./node-vertex.js":13,"three":76}],5:[function(require,module,exports){
 module.exports = 'data:image/png;base64,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';
 
 },{}],6:[function(require,module,exports){
 var THREE = require('three');
-var getHexColor = require('./utils.js').getHexColor;
 
 module.exports = edgeView;
 
 function edgeView(scene) {
   var total = 0;
-  var positions; // positions of each edge in the graph (array of objects pairs from, to)
+  var edges; // edges of the graph
   var colors, points; // buffer attributes that represent edge.
   var geometry, edgeMesh;
-  var colorDirty;
+  var colorDirty, positionDirty;
+
+  // declares bindings between model events and update handlers
+  var edgeConnector = {
+    fromColor: fromColor,
+    toColor: toColor,
+    'from.position': fromPosition,
+    'to.position': toPosition
+  };
 
   return {
-    initPositions: initPositions,
+    init: init,
     update: update,
-    needsUpdate: needsUpdate,
-    color: color
+    needsUpdate: needsUpdate
   };
 
   function needsUpdate() {
@@ -537,39 +539,40 @@ function edgeView(scene) {
   }
 
   function update() {
-    for (var i = 0; i < total; ++i) {
-      updateEdgePosition(i);
+    if (positionDirty) {
+      geometry.getAttribute('position').needsUpdate = true;
+      positionDirty = false;
     }
-    geometry.getAttribute('position').needsUpdate = true;
+
     if (colorDirty) {
       geometry.getAttribute('color').needsUpdate = true;
       colorDirty = false;
     }
   }
 
-  function color(idx, fromColorHex, toColorHex) {
-    if (fromColorHex === undefined) {
-      var idx6 = idx * 6;
-      return {
-        from: getHexColor(colors,  idx6),
-        to: getHexColor(colors, idx6 + 3)
-      };
-    }
+  function init(edgeCollection) {
+    disconnectOldEdges();
 
-    updateEdgeColor(idx/2, fromColorHex, toColorHex);
-  }
+    edges = edgeCollection;
+    total = edges.length;
 
-  function initPositions(edgePositions) {
-    positions = edgePositions;
-    total = positions.length/2;
-    points = new Float32Array(total * 6);
+    // If we can reuse old arrays - reuse them:
+    var pointsInitialized = (points !== undefined) && points.length === total * 6;
+    if (!pointsInitialized) points = new Float32Array(total * 6);
     var colorsInitialized = (colors !== undefined) && colors.length === total * 6;
     if (!colorsInitialized) colors = new Float32Array(total * 6);
 
     for (var i = 0; i < total; ++i) {
-      updateEdgePosition(i);
-      if (!colorsInitialized) updateEdgeColor(i);
+      var edge = edges[i];
+      edge.connect(edgeConnector);
+
+      fromPosition(edge);
+      toPosition(edge);
+
+      fromColor(edge);
+      toColor(edge);
     }
+
     geometry = new THREE.BufferGeometry();
     var material = new THREE.LineBasicMaterial({
       vertexColors: THREE.VertexColors
@@ -587,14 +590,28 @@ function edgeView(scene) {
     scene.add(edgeMesh);
   }
 
-  function updateEdgeColor(i, fromColorHex, toColorHex) {
-    if (typeof fromColorHex !== 'number') fromColorHex = 0xffffff;
-    if (typeof toColorHex !== 'number') toColorHex = fromColorHex;
-    var i6 = i * 6;
+  function disconnectOldEdges() {
+    if (!edges) return;
+    for (var i = 0; i < edges.length; ++i) {
+      edges[i].disconnect(edgeConnector);
+    }
+  }
+
+  function fromColor(edge) {
+    var fromColorHex = edge.fromColor;
+
+    var i6 = edge.idx * 6;
 
     colors[i6    ] = ((fromColorHex >> 16) & 0xFF)/0xFF;
     colors[i6 + 1] = ((fromColorHex >> 8) & 0xFF)/0xFF;
     colors[i6 + 2] = (fromColorHex & 0xFF)/0xFF;
+
+    colorDirty = true;
+  }
+
+  function toColor(edge) {
+    var toColorHex = edge.toColor;
+    var i6 = edge.idx * 6;
 
     colors[i6 + 3] = ((toColorHex >> 16) & 0xFF)/0xFF;
     colors[i6 + 4] = ((toColorHex >> 8) & 0xFF)/0xFF;
@@ -603,20 +620,30 @@ function edgeView(scene) {
     colorDirty = true;
   }
 
-  function updateEdgePosition(i) {
-    var from = positions[2 * i];
-    var to = positions[2 * i + 1];
-    var i6 = i * 6;
+  function fromPosition(edge) {
+    var from = edge.from.position;
+    var i6 = edge.idx * 6;
+
     points[i6] = from.x;
     points[i6 + 1] = from.y;
     points[i6 + 2] = from.z;
+
+    positionDirty = true;
+  }
+
+  function toPosition(edge) {
+    var to = edge.to.position;
+    var i6 = edge.idx * 6;
+
     points[i6 + 3] = to.x;
     points[i6 + 4] = to.y;
     points[i6 + 5] = to.z;
+
+    positionDirty = true;
   }
 }
 
-},{"./utils.js":15,"three":77}],7:[function(require,module,exports){
+},{"three":76}],7:[function(require,module,exports){
 /**
  * Moves camera to given point, and stops it and given radius
  */
@@ -641,7 +668,7 @@ function flyTo(camera, to, radius) {
   camera.position.z = cameraEndPos.z;
 }
 
-},{"./intersect.js":10,"three":77}],8:[function(require,module,exports){
+},{"./intersect.js":10,"three":76}],8:[function(require,module,exports){
 /**
  * Gives an index of a node under mouse coordinates
  */
@@ -769,8 +796,9 @@ function createHitTest(domElement) {
   }
 
   function setMouseCoordinates(e) {
-    mouse.x = (e.clientX / domElement.clientWidth) * 2 - 1;
-    mouse.y = -(e.clientY / domElement.clientHeight) * 2 + 1;
+    var boundingRect = domElement.getBoundingClientRect();
+    mouse.x = ((e.pageX - boundingRect.left) / boundingRect.width) * 2 - 1;
+    mouse.y = -((e.pageY - boundingRect.top) / boundingRect.height) * 2 + 1;
 
     domMouse.x = e.clientX;
     domMouse.y = e.clientY;
@@ -894,7 +922,7 @@ function createHitTest(domElement) {
   }
 }
 
-},{"ngraph.events":44,"three":77}],9:[function(require,module,exports){
+},{"ngraph.events":44,"three":76}],9:[function(require,module,exports){
 var FlyControls = require('three.fly');
 var eventify = require('ngraph.events');
 var THREE = require('three');
@@ -974,7 +1002,7 @@ function createInput(camera, graph, domElement) {
   }
 }
 
-},{"./hitTest.js":8,"ngraph.events":44,"three":77,"three.fly":75}],10:[function(require,module,exports){
+},{"./hitTest.js":8,"ngraph.events":44,"three":76,"three.fly":74}],10:[function(require,module,exports){
 module.exports = intersect;
 
 /**
@@ -1001,6 +1029,146 @@ function intersect(from, to, r) {
 }
 
 },{}],11:[function(require,module,exports){
+// This module allows to replace object properties with getters/setters,
+// so consumers can "connect" to them and be notified when properties are
+// updated.
+module.exports = makeActive;
+
+function makeActive(model) {
+  if (!model) throw new Error('Model is required to be an object');
+  if (typeof model.connect === 'function') throw new Error('connect() alread exists on model');
+  if (typeof model.disconnect === 'function') throw new Error('disconnect() alread exists on model');
+
+  var connected = new Map();
+
+  model.connect = connect;
+  model.disconnect = disconnect;
+
+  return model;
+
+  function replaceProperty(name) {
+    var propertyDescriptor = Object.getOwnPropertyDescriptor(model, name);
+    if (!propertyDescriptor) return false; // there is no such name!
+    if (propertyDescriptor && typeof propertyDescriptor.get === 'function') return true; // Already replaced
+
+    var value = model[name];
+
+    Object.defineProperty(model, name, {
+      get: function() { return value; },
+      set: function(v) {
+        value = v;
+        triggerListeners(name);
+      }
+    });
+
+    return true;
+  }
+
+  function triggerListeners(name) {
+    var myListeners = connected.get(name);
+    if (!myListeners) return;
+
+    myListeners.forEach(function(listener) {
+      listener(model);
+    });
+  }
+
+  function connect(key, cb) {
+    if (typeof key === 'string') {
+      connectSingleKey(key, cb);
+      return;
+    }
+
+    var query = key;
+
+    Object.keys(key).forEach(connectOneKey);
+
+    function connectOneKey(keyName) {
+      connectSingleKey(keyName, query[keyName]);
+    }
+  }
+
+  function connectSingleKey(key, cb) {
+    var parts = key.split('.');
+    var myListeners = connected.get(key);
+
+    if (!myListeners) {
+      var propertyCreated = replaceProperty(parts[0]);
+      if (!propertyCreated) {
+        console.error('trying to connect to property ' + parts[0] + ' that is not part of the model');
+        return;
+      }
+
+      myListeners = new Set();
+      connected.set(key, myListeners);
+    }
+
+    if (parts.length === 1) {
+      myListeners.add(cb);
+    } else {
+      // handling case for composite path. E.g.:
+      //  model.connect('from.position', cb)
+      // this means that consumer wants to be notified when from.position
+      // has changed
+      var connector = model[parts[0]];
+      var rest = parts.slice(1).join('.');
+
+      // remember the original function, so that we can find and delete it on disconnect
+      forwardModel.cb = cb;
+      myListeners.add(forwardModel);
+
+      // forward connection to request to property:
+      if (typeof connector.connect !== 'function') {
+        makeActive(connector);
+      }
+      connector.connect(rest, forwardModel);
+    }
+
+    function forwardModel(/* subModel */) {
+      // todo: this could probably use model from sub properties...
+      cb(model);
+    }
+  }
+
+  function disconnect(key, cb) {
+    if (typeof key === 'string') return deleteSingleKey(key, cb);
+
+    Object.keys(key).forEach(function(name) {
+      deleteSingleKey(name, key[name]);
+    });
+  }
+
+  function deleteSingleKey(key, cb) {
+    var myListeners = connected.get(key);
+    // todo: composite?
+    if (!myListeners) return;
+    if (myListeners.delete(cb)) return; // callback was succesfully deleted
+    // otherwise let's check if we are in composite mode:
+    var parts = key.split('.');
+    if (parts.length === 1) return; // no, we are not in composite, just have no such listener
+
+    // yes, we are in composite key. Need to iterate all subscribers to find
+    // which one is trying to disconnect
+    var found;
+    myListeners.forEach(function(subscriber) {
+      if (subscriber.cb === cb) {
+        found = subscriber;
+      }
+    });
+
+    if (found) {
+      // first delete it from our level of listeners
+      myListeners.delete(found);
+
+      // then forward disconnect request to the child models:
+      var connector = model[parts[0]];
+      var rest = parts.slice(1).join('.');
+      connector.disconnect(rest, found);
+    }
+  }
+}
+
+},{}],12:[function(require,module,exports){
 module.exports = [
   'uniform vec3 color;',
   'uniform sampler2D texture;',
@@ -1015,7 +1183,7 @@ module.exports = [
   '}'
 ].join('\n');
 
-},{}],12:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
 module.exports = [
 'attribute float size;',
 'attribute vec3 customColor;',
@@ -1030,61 +1198,67 @@ module.exports = [
 '}'
 ].join('\n');
 
-},{}],13:[function(require,module,exports){
+},{}],14:[function(require,module,exports){
 var THREE = require('three');
 var particleMaterial = require('./createMaterial.js')();
-var getHexColor = require('./utils.js').getHexColor;
-
-// Default UI for node
-var SIZE = 20;
-var COLOR = 0xFF0894;
 
 module.exports = nodeView;
 
 function nodeView(scene) {
   var total;
-  var positions;
+  var nodes;
   var colors, points, sizes;
   var geometry, particleSystem;
-  var colorDirty, sizeDirty;
+  var colorDirty, sizeDirty, positionDirty;
 
-  return {
-    initPositions: initPositions,
-    update: update,
-    needsUpdate: needsUpdate,
-    getBoundingSphere: getBoundingSphere,
+  // declares bindings between node properties to functions within current view
+  var nodeConnector = {
+    position: position,
     color: color,
     size: size
+  };
+
+  return {
+    init: init,
+    update: update,
+    needsUpdate: needsUpdate,
+    getBoundingSphere: getBoundingSphere
   };
 
   function needsUpdate() {
     return colorDirty || sizeDirty;
   }
 
-  function color(idx, hexColor) {
-    var idx3 = idx * 3;
-    if (hexColor === undefined) {
-      return getHexColor(colors, idx3);
-    }
+  function color(node) {
+    var idx3 = node.idx * 3;
+    var hexColor = node.color;
     colors[idx3    ] = (hexColor >> 16) & 0xff;
     colors[idx3 + 1] = (hexColor >>  8) & 0xff;
     colors[idx3 + 2] = (hexColor      ) & 0xff;
     colorDirty = true;
   }
 
-  function size(idx, sizeValue) {
-    if (sizeValue === undefined) {
-      return sizes[idx];
-    }
-    sizes[idx] = sizeValue;
+  function size(node) {
+    sizes[node.idx] = node.size;
     sizeDirty = true;
   }
 
+  function position(node) {
+    var idx3 = node.idx * 3;
+    var pos = node.position;
+
+    points[idx3 + 0] = pos.x;
+    points[idx3 + 1] = pos.y;
+    points[idx3 + 2] = pos.z;
+
+    positionDirty = true;
+  }
+
   function update() {
-    for (var i = 0; i < total; ++i) {
-      setNodePosition(i * 3, positions[i]);
+    if (positionDirty) {
+      geometry.getAttribute('position').needsUpdate = true;
+      positionDirty = false;
     }
-    geometry.getAttribute('position').needsUpdate = true;
     if (colorDirty) {
       geometry.getAttribute('customColor').needsUpdate = true;
       colorDirty = false;
@@ -1101,19 +1275,16 @@ function nodeView(scene) {
     return geometry.boundingSphere;
   }
 
-  function setNodePosition(nodeIdx, pos) {
-    points[nodeIdx + 0] = pos.x;
-    points[nodeIdx + 1] = pos.y;
-    points[nodeIdx + 2] = pos.z;
-  }
+  function init(nodeCollection) {
+    disconnectOldNodes();
 
-  function initPositions(nodePositions) {
-    total = nodePositions.length;
-    positions = nodePositions;
-    points = new Float32Array(total * 3);
+    total = nodeCollection.length;
+    nodes = nodeCollection;
+    // if we can ruse old arrays - do it! No need to stress the GC
+    var pointsInitialized = points !== undefined && points.length === total * 3;
+    if (!pointsInitialized) points = new Float32Array(total * 3);
     var colorsInitialized = colors !== undefined && colors.length === total * 3;
     if (!colorsInitialized) colors = new Float32Array(total * 3);
-
     var sizesInitialized = sizes !== undefined && sizes.length === total;
     if (!sizesInitialized) sizes = new Float32Array(total);
 
@@ -1134,14 +1305,27 @@ function nodeView(scene) {
     scene.add(particleSystem);
 
     for (var i = 0; i < total; ++i) {
-      setNodePosition(i * 3, positions[i]);
-      if (!colorsInitialized) color(i, COLOR);
-      if (!sizesInitialized) size(i, SIZE);
+      var node = nodes[i];
+      // first make sure any update to underlying node properties result in
+      // graph update:
+      node.connect(nodeConnector);
+
+      // then invoke first-time node rendering
+      position(node);
+      color(node);
+      size(node);
+    }
+  }
+
+  function disconnectOldNodes() {
+    if (!nodes) return;
+    for (var i = 0; i < nodes.length; ++i) {
+      nodes[i].disconnect(nodeConnector);
     }
   }
 }
 
-},{"./createMaterial.js":4,"./utils.js":15,"three":77}],14:[function(require,module,exports){
+},{"./createMaterial.js":4,"three":76}],15:[function(require,module,exports){
 /**
  * manages view for tooltips shown when user hover over a node
  */
@@ -1186,19 +1370,79 @@ function createTooltipView(container) {
   }
 }
 
-},{"../style/style.js":79,"element-class":42,"insert-css":43}],15:[function(require,module,exports){
-module.exports = {
-  getHexColor: getHexColor
-};
+},{"../style/style.js":78,"element-class":20,"insert-css":43}],16:[function(require,module,exports){
+/**
+ * Controls physics engine settings, like spring length, drag coefficient, etc.
+ *
+ * @param {config.pixel} renderer settings controller (see https://github.com/anvaka/config.pixel)
+ */
+module.exports = addLayoutSettings;
 
-function getHexColor(buffer, idx) {
-  var r = buffer[idx    ];
-  var g = buffer[idx + 1];
-  var b = buffer[idx + 2];
-  return (r << 16) | (g << 8) | b;
+function addLayoutSettings(settings) {
+  var renderer = settings.renderer();
+  var layout = renderer.layout();
+  var gui = settings.gui();
+  var model = createLayoutModel(renderer);
+  // Maybe in future localization will bite you, anvaka...
+  // -- Your friend from the past, you
+  var folder = gui.addFolder('Layout Settings');
+
+  var support3d = typeof layout.on === 'function' && typeof layout.is3d === 'function';
+  if (support3d) {
+    layout.on('reset', updateMode);
+    folder.add(model, 'is3d').onChange(set3dMode);
+  }
+
+  folder.add(model, 'springLength', 0, 1000).onChange(setSimulatorOption('springLength'));
+  folder.add(model, 'springCoeff', 0, 0.1).onChange(setSimulatorOption('springCoeff'));
+  folder.add(model, 'gravity', -50, 0).onChange(setSimulatorOption('gravity'));
+  folder.add(model, 'theta', 0, 2).onChange(setSimulatorOption('theta'));
+  folder.add(model, 'dragCoeff', 0, 1).onChange(setSimulatorOption('dragCoeff'));
+  folder.add(model, 'timeStep', 1, 100).onChange(setSimulatorOption('timeStep'));
+
+  function setSimulatorOption(optionName) {
+    return function() {
+      // we need to call this every time, since renderer can update layout at any time
+      var layout = renderer.layout();
+      var simulator = layout.simulator;
+      simulator[optionName](model[optionName]);
+      renderer.stable(false);
+      renderer.focus();
+    };
+  }
+
+  function set3dMode() {
+    layout.is3d(model.is3d);
+    renderer.focus();
+  }
+
+  function updateMode() {
+    model.is3d = layout.is3d();
+    gui.update();
+  }
+
+  function createLayoutModel(renderer) {
+    if (!renderer) throw new Error('Renderer is required for configuration options');
+
+    var layout = renderer.layout();
+    if (!layout) throw new Error('Could not get layout instance from the renderer');
+
+    var simulator = layout.simulator;
+    if (!simulator) throw new Error('Simlator is not defined on this layout instance');
+
+    return {
+      is3d: true,
+      springLength: simulator.springLength(),
+      springCoeff: simulator.springCoeff(),
+      gravity: simulator.gravity(),
+      theta: simulator.theta(),
+      dragCoeff: simulator.dragCoeff(),
+      timeStep: simulator.timeStep()
+    };
+  }
 }
 
-},{}],16:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 var dat = require('exdat');
 var addGlobalViewSettings = require('config.view');
 var addLayoutSettings = require('config.layout');
@@ -1324,79 +1568,7 @@ function createSettingsView(renderer) {
   }
 }
 
-},{"config.layout":17,"config.view":18,"exdat":40}],17:[function(require,module,exports){
-/**
- * Controls physics engine settings, like spring length, drag coefficient, etc.
- *
- * @param {config.pixel} renderer settings controller (see https://github.com/anvaka/config.pixel)
- */
-module.exports = addLayoutSettings;
-
-function addLayoutSettings(settings) {
-  var renderer = settings.renderer();
-  var layout = renderer.layout();
-  var gui = settings.gui();
-  var model = createLayoutModel(renderer);
-  // Maybe in future localization will bite you, anvaka...
-  // -- Your friend from the past, you
-  var folder = gui.addFolder('Layout Settings');
-
-  var support3d = typeof layout.on === 'function' && typeof layout.is3d === 'function';
-  if (support3d) {
-    layout.on('reset', updateMode);
-    folder.add(model, 'is3d').onChange(set3dMode);
-  }
-
-  folder.add(model, 'springLength', 0, 1000).onChange(setSimulatorOption('springLength'));
-  folder.add(model, 'springCoeff', 0, 0.1).onChange(setSimulatorOption('springCoeff'));
-  folder.add(model, 'gravity', -50, 0).onChange(setSimulatorOption('gravity'));
-  folder.add(model, 'theta', 0, 2).onChange(setSimulatorOption('theta'));
-  folder.add(model, 'dragCoeff', 0, 1).onChange(setSimulatorOption('dragCoeff'));
-  folder.add(model, 'timeStep', 1, 100).onChange(setSimulatorOption('timeStep'));
-
-  function setSimulatorOption(optionName) {
-    return function() {
-      // we need to call this every time, since renderer can update layout at any time
-      var layout = renderer.layout();
-      var simulator = layout.simulator;
-      simulator[optionName](model[optionName]);
-      renderer.stable(false);
-      renderer.focus();
-    };
-  }
-
-  function set3dMode() {
-    layout.is3d(model.is3d);
-    renderer.focus();
-  }
-
-  function updateMode() {
-    model.is3d = layout.is3d();
-    gui.update();
-  }
-
-  function createLayoutModel(renderer) {
-    if (!renderer) throw new Error('Renderer is required for configuration options');
-
-    var layout = renderer.layout();
-    if (!layout) throw new Error('Could not get layout instance from the renderer');
-
-    var simulator = layout.simulator;
-    if (!simulator) throw new Error('Simlator is not defined on this layout instance');
-
-    return {
-      is3d: true,
-      springLength: simulator.springLength(),
-      springCoeff: simulator.springCoeff(),
-      gravity: simulator.gravity(),
-      theta: simulator.theta(),
-      dragCoeff: simulator.dragCoeff(),
-      timeStep: simulator.timeStep()
-    };
-  }
-}
-
-},{}],18:[function(require,module,exports){
+},{"config.layout":16,"config.view":18,"exdat":42}],18:[function(require,module,exports){
 /**
  * Controls available settings for the gobal view settings (like node colors,
  * size, 3d/2d, etc.)
@@ -1412,10 +1584,10 @@ function addGlobalViewSettings(settings) {
   var folder = gui.addFolder('View Settings');
 
   var model = {
-    nodeColor: [0xff, 0xff, 0xff],
-    backgroundColor: [0x00, 0x00, 0x00],
-    linkStartColor: [0x33, 0x33, 0x33],
-    linkEndColor: [0x33, 0x33, 0x33],
+    nodeColor: 0xffffff,
+    backgroundColor: 0x000000,
+    linkStartColor: 0x333333,
+    linkEndColor: 0x333333,
     nodeSize: 15,
     stable: changeStable
   };
@@ -1443,12 +1615,11 @@ function addGlobalViewSettings(settings) {
   }
 
   function setNodeColor() {
-    var graph = renderer.graph();
-    graph.forEachNode(setCustomNodeColor);
+    renderer.forEachNode(setCustomNodeColor);
     renderer.focus();
 
-    function setCustomNodeColor(node) {
-      renderer.nodeColor(node.id, model.nodeColor);
+    function setCustomNodeColor(ui) {
+      ui.color = model.nodeColor;
     }
   }
 
@@ -1457,27 +1628,203 @@ function addGlobalViewSettings(settings) {
   }
 
   function setNodeSize() {
-    var graph = renderer.graph();
-    graph.forEachNode(setCustomNodeSize);
+    renderer.forEachNode(setCustomNodeSize);
     renderer.focus();
 
-    function setCustomNodeSize(node) {
-      renderer.nodeSize(node.id, model.nodeSize);
+    function setCustomNodeSize(ui) {
+      ui.size = model.nodeSize;
     }
   }
 
   function setLinkColor() {
-    var graph = renderer.graph();
-    graph.forEachLink(setCustomLinkUI);
+    renderer.forEachLink(setCustomLinkUI);
     renderer.focus();
   }
 
-  function setCustomLinkUI(link) {
-    renderer.linkColor(link.id, model.linkStartColor, model.linkEndColor);
+  function setCustomLinkUI(ui) {
+    ui.fromColor = model.linkStartColor;
+    ui.toColor = model.linkEndColor;
   }
 }
 
 },{}],19:[function(require,module,exports){
+module.exports = createLegend;
+
+function createLegend(allSettings, folderName, legend) {
+  var renderer = allSettings.renderer();
+  var gui = allSettings.gui();
+  var group = gui.addFolder(folderName);
+  var model = Object.create(null);
+  var hiddenLinks = Object.create(null);
+
+  for (var i = 0; i < legend.length; ++i) {
+    var item = legend[i];
+    model[item.name] = item.color;
+    hiddenLinks[item.name] = [];
+    group.addColor(model, item.name)
+      .onChange(colorLinks)
+      .name(toggle(item.name));
+  }
+
+  group.open();
+
+  listToToggleEvents();
+  colorLinks();
+
+  function listToToggleEvents() {
+    var checkboxes = group.domElement.querySelectorAll('input.toggle');
+
+    for (var i = 0; i < checkboxes.length; ++i) {
+      checkboxes[i].addEventListener('change', handleChange, false);
+    }
+
+    function handleChange(e) {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (this.checked) {
+        showGroup(this.id);
+      } else {
+        hideGroup(this.id);
+      }
+    }
+  }
+
+  function colorLinks() {
+    var graph = renderer.graph();
+    graph.forEachLink(colorLink);
+    renderer.focus();
+
+    function colorLink(link) {
+      for (var i = 0; i < legend.length; ++i) {
+        var item = legend[i];
+        if (!item.filter(link)) continue;
+        var ui = renderer.getLink(link.id);
+        if (ui) {
+          ui.fromColor = model[item.name];
+          ui.toColor = model[item.name];
+        }
+        return;
+      }
+    }
+  }
+
+  function showGroup(groupName) {
+    var links = hiddenLinks[groupName];
+    if (!links) return;
+
+    var graph = renderer.graph();
+    graph.beginUpdate();
+    for (var i = 0; i < links.length; ++i) {
+      var link = links[i];
+      graph.addLink(link.fromId, link.toId, link.data);
+    }
+    graph.endUpdate();
+
+    links.splice(0, links.length);
+    colorLinks();
+  }
+
+  function hideGroup(groupName) {
+    var links = hiddenLinks[groupName];
+    if (!links) return;
+    var legendItem = getLegendItemByName(groupName);
+    if (!legendItem) return;
+
+    var graph = renderer.graph();
+    graph.forEachLink(noteLinksToRemove);
+
+    graph.beginUpdate();
+    for (var i = 0; i < links.length; ++i) {
+      graph.removeLink(links[i]);
+    }
+    graph.endUpdate();
+
+    colorLinks();
+
+    function noteLinksToRemove(link) {
+      if (legendItem.filter(link)) links.push(link);
+    }
+  }
+
+  function getLegendItemByName(name) {
+    for (var i = 0; i < legend.length; ++i) {
+      if (legend[i].name === name) return legend[i];
+    }
+  }
+
+  function toggle(name) {
+    return [
+      '<span style="-webkit-touch-callout: none; -webkit-user-select: none; -khtml-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none;">',
+      '<input type="checkbox" name="checkbox" id="' + name + '" class="toggle" value="value" checked>',
+      '<label for="' + name + '">' + name + '</label>',
+      '</span>'
+    ].join('\n');
+  }
+}
+
+},{}],20:[function(require,module,exports){
+module.exports = function(opts) {
+  return new ElementClass(opts)
+}
+
+function indexOf(arr, prop) {
+  if (arr.indexOf) return arr.indexOf(prop)
+  for (var i = 0, len = arr.length; i < len; i++)
+    if (arr[i] === prop) return i
+  return -1
+}
+
+function ElementClass(opts) {
+  if (!(this instanceof ElementClass)) return new ElementClass(opts)
+  var self = this
+  if (!opts) opts = {}
+
+  // similar doing instanceof HTMLElement but works in IE8
+  if (opts.nodeType) opts = {el: opts}
+
+  this.opts = opts
+  this.el = opts.el || document.body
+  if (typeof this.el !== 'object') this.el = document.querySelector(this.el)
+}
+
+ElementClass.prototype.add = function(className) {
+  var el = this.el
+  if (!el) return
+  if (el.className === "") return el.className = className
+  var classes = el.className.split(' ')
+  if (indexOf(classes, className) > -1) return classes
+  classes.push(className)
+  el.className = classes.join(' ')
+  return classes
+}
+
+ElementClass.prototype.remove = function(className) {
+  var el = this.el
+  if (!el) return
+  if (el.className === "") return
+  var classes = el.className.split(' ')
+  var idx = indexOf(classes, className)
+  if (idx > -1) classes.splice(idx, 1)
+  el.className = classes.join(' ')
+  return classes
+}
+
+ElementClass.prototype.has = function(className) {
+  var el = this.el
+  if (!el) return
+  var classes = el.className.split(' ')
+  return indexOf(classes, className) > -1
+}
+
+ElementClass.prototype.toggle = function(className) {
+  var el = this.el
+  if (!el) return
+  if (this.has(className)) this.remove(className)
+  else this.add(className)
+}
+
+},{}],21:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -1660,7 +2007,7 @@ function recalculateHSV(color) {
 
 }
 
-},{"../utils/common.js":36,"./interpret.js":20,"./math.js":21,"./toString.js":22}],20:[function(require,module,exports){
+},{"../utils/common.js":38,"./interpret.js":22,"./math.js":23,"./toString.js":24}],22:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2003,7 +2350,7 @@ function createInterpert() {
 
 }
 
-},{"../utils/common.js":36,"./toString.js":22}],21:[function(require,module,exports){
+},{"../utils/common.js":38,"./toString.js":24}],23:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2104,7 +2451,7 @@ function math() {
   };
 }
 
-},{}],22:[function(require,module,exports){
+},{}],24:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2141,7 +2488,7 @@ function toString(color) {
 
 }
 
-},{"../utils/common.js":36}],23:[function(require,module,exports){
+},{"../utils/common.js":38}],25:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2225,7 +2572,7 @@ common.extend(
   }
 );
 
-},{"../dom/dom.js":34,"../utils/common.js":36,"./Controller.js":25}],24:[function(require,module,exports){
+},{"../dom/dom.js":36,"../utils/common.js":38,"./Controller.js":27}],26:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2546,7 +2893,7 @@ function hueGradient(elem) {
   elem.style.cssText += 'background: linear-gradient(top,  #ff0000 0%,#ff00ff 17%,#0000ff 34%,#00ffff 50%,#00ff00 67%,#ffff00 84%,#ff0000 100%);'
 }
 
-},{"../color/Color.js":19,"../color/interpret.js":20,"../dom/dom.js":34,"../utils/common.js":36,"./Controller.js":25}],25:[function(require,module,exports){
+},{"../color/Color.js":21,"../color/interpret.js":22,"../dom/dom.js":36,"../utils/common.js":38,"./Controller.js":27}],27:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2687,7 +3034,7 @@ common.extend(
 );
 
 
-},{"../utils/common.js":36,"../utils/escapeHtml.js":38}],26:[function(require,module,exports){
+},{"../utils/common.js":38,"../utils/escapeHtml.js":40}],28:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2757,7 +3104,7 @@ common.extend(
 
 );
 
-},{"../dom/dom.js":34,"../utils/common.js":36,"./Controller.js":25}],27:[function(require,module,exports){
+},{"../dom/dom.js":36,"../utils/common.js":38,"./Controller.js":27}],29:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -2899,7 +3246,7 @@ function numDecimals(x) {
   }
 }
 
-},{"../utils/common.js":36,"./Controller.js":25}],28:[function(require,module,exports){
+},{"../utils/common.js":38,"./Controller.js":27}],30:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3030,7 +3377,7 @@ function roundToDecimal(value, decimals) {
   return Math.round(value * tenTo) / tenTo;
 }
 
-},{"../dom/dom.js":34,"../utils/common.js":36,"./NumberController.js":27}],29:[function(require,module,exports){
+},{"../dom/dom.js":36,"../utils/common.js":38,"./NumberController.js":29}],31:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3160,7 +3507,7 @@ function map(v, i1, i2, o1, o2) {
   return o1 + (o2 - o1) * ((v - i1) / (i2 - i1));
 }
 
-},{"../dom/dom.js":34,"../utils/common.js":36,"../utils/css.js":37,"./NumberController.js":27}],30:[function(require,module,exports){
+},{"../dom/dom.js":36,"../utils/common.js":38,"../utils/css.js":39,"./NumberController.js":29}],32:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3260,7 +3607,7 @@ common.extend(
 
 );
 
-},{"../dom/dom.js":34,"../utils/common.js":36,"./Controller.js":25}],31:[function(require,module,exports){
+},{"../dom/dom.js":36,"../utils/common.js":38,"./Controller.js":27}],33:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3347,7 +3694,7 @@ common.extend(
 
 );
 
-},{"../dom/dom.js":34,"../utils/common.js":36,"./Controller.js":25}],32:[function(require,module,exports){
+},{"../dom/dom.js":36,"../utils/common.js":38,"./Controller.js":27}],34:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3413,7 +3760,7 @@ function factory(object, property) {
 
 }
 
-},{"../utils/common.js":36,"./BooleanController.js":23,"./FunctionController.js":26,"./NumberControllerBox.js":28,"./NumberControllerSlider.js":29,"./OptionController.js":30,"./StringController.js":31}],33:[function(require,module,exports){
+},{"../utils/common.js":38,"./BooleanController.js":25,"./FunctionController.js":28,"./NumberControllerBox.js":30,"./NumberControllerSlider.js":31,"./OptionController.js":32,"./StringController.js":33}],35:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3527,7 +3874,7 @@ function lockScroll(e) {
   console.log(e);
 }
 
-},{"../utils/common.js":36,"./dom.js":34}],34:[function(require,module,exports){
+},{"../utils/common.js":38,"./dom.js":36}],36:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3814,7 +4161,7 @@ var dom = {
 
 module.exports = dom;
 
-},{"../utils/common.js":36}],35:[function(require,module,exports){
+},{"../utils/common.js":38}],37:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -5216,7 +5563,7 @@ function createGUI() {
   return GUI;
 }
 
-},{"../controllers/BooleanController.js":23,"../controllers/ColorController.js":24,"../controllers/Controller.js":25,"../controllers/FunctionController.js":26,"../controllers/NumberControllerBox.js":28,"../controllers/NumberControllerSlider.js":29,"../controllers/factory.js":32,"../dom/CenteredDiv.js":33,"../dom/dom.js":34,"../utils/common.js":36,"../utils/css.js":37,"../utils/requestAnimationFrame.js":39}],36:[function(require,module,exports){
+},{"../controllers/BooleanController.js":25,"../controllers/ColorController.js":26,"../controllers/Controller.js":27,"../controllers/FunctionController.js":28,"../controllers/NumberControllerBox.js":30,"../controllers/NumberControllerSlider.js":31,"../controllers/factory.js":34,"../dom/CenteredDiv.js":35,"../dom/dom.js":36,"../utils/common.js":38,"../utils/css.js":39,"../utils/requestAnimationFrame.js":41}],38:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -5358,7 +5705,7 @@ function common() {
   };
 }
 
-},{}],37:[function(require,module,exports){
+},{}],39:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -5393,7 +5740,7 @@ function css() {
   };
 }
 
-},{}],38:[function(require,module,exports){
+},{}],40:[function(require,module,exports){
 module.exports = escape;
 
 var entityMap = {
@@ -5411,7 +5758,7 @@ function escape(string) {
   });
 }
 
-},{}],39:[function(require,module,exports){
+},{}],41:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -5444,7 +5791,7 @@ function raf() {
       };
 }
 
-},{}],40:[function(require,module,exports){
+},{}],42:[function(require,module,exports){
 /** @license
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -5484,179 +5831,7 @@ module.exports = {
   GUI: require('./dat/gui/GUI.js')
 };
 
-},{"./dat/color/Color.js":19,"./dat/color/interpret.js":20,"./dat/color/math.js":21,"./dat/controllers/BooleanController.js":23,"./dat/controllers/ColorController.js":24,"./dat/controllers/Controller.js":25,"./dat/controllers/FunctionController.js":26,"./dat/controllers/NumberController.js":27,"./dat/controllers/NumberControllerBox.js":28,"./dat/controllers/NumberControllerSlider.js":29,"./dat/controllers/OptionController.js":30,"./dat/controllers/StringController.js":31,"./dat/dom/dom.js":34,"./dat/gui/GUI.js":35}],41:[function(require,module,exports){
-module.exports = createLegend;
-
-function createLegend(allSettings, folderName, legend) {
-  var renderer = allSettings.renderer();
-  var gui = allSettings.gui();
-  var group = gui.addFolder(folderName);
-  var model = Object.create(null);
-  var hiddenLinks = Object.create(null);
-
-  for (var i = 0; i < legend.length; ++i) {
-    var item = legend[i];
-    model[item.name] = item.color;
-    hiddenLinks[item.name] = [];
-    group.addColor(model, item.name)
-      .onChange(colorLinks)
-      .name(toggle(item.name));
-  }
-
-  group.open();
-
-  listToToggleEvents();
-  colorLinks();
-
-  function listToToggleEvents() {
-    var checkboxes = group.domElement.querySelectorAll('input.toggle');
-
-    for (var i = 0; i < checkboxes.length; ++i) {
-      checkboxes[i].addEventListener('change', handleChange, false);
-    }
-
-    function handleChange(e) {
-      e.preventDefault();
-      e.stopPropagation();
-
-      if (this.checked) {
-        showGroup(this.id);
-      } else {
-        hideGroup(this.id);
-      }
-    }
-  }
-
-  function colorLinks() {
-    var graph = renderer.graph();
-    graph.forEachLink(colorLink);
-    renderer.focus();
-
-    function colorLink(link) {
-      for (var i = 0; i < legend.length; ++i) {
-        var item = legend[i];
-        if (!item.filter(link)) continue;
-        renderer.linkColor(link.id, model[item.name]);
-      }
-    }
-  }
-
-  function showGroup(groupName) {
-    var links = hiddenLinks[groupName];
-    if (!links) return;
-
-    var graph = renderer.graph();
-    graph.beginUpdate();
-    for (var i = 0; i < links.length; ++i) {
-      var link = links[i];
-      graph.addLink(link.fromId, link.toId, link.data);
-    }
-    graph.endUpdate();
-
-    links.splice(0, links.length);
-    colorLinks();
-  }
-
-  function hideGroup(groupName) {
-    var links = hiddenLinks[groupName];
-    if (!links) return;
-    var legendItem = getLegendItemByName(groupName);
-    if (!legendItem) return;
-
-    var graph = renderer.graph();
-    graph.forEachLink(noteLinksToRemove);
-
-    graph.beginUpdate();
-    for (var i = 0; i < links.length; ++i) {
-      graph.removeLink(links[i]);
-    }
-    graph.endUpdate();
-
-    colorLinks();
-
-    function noteLinksToRemove(link) {
-      if (legendItem.filter(link)) links.push(link);
-    }
-  }
-
-  function getLegendItemByName(name) {
-    for (var i = 0; i < legend.length; ++i) {
-      if (legend[i].name === name) return legend[i];
-    }
-  }
-
-  function toggle(name) {
-    return [
-      '<span style="-webkit-touch-callout: none; -webkit-user-select: none; -khtml-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none;">',
-      '<input type="checkbox" name="checkbox" id="' + name + '" class="toggle" value="value" checked>',
-      '<label for="' + name + '">' + name + '</label>',
-      '</span>'
-    ].join('\n');
-  }
-}
-
-},{}],42:[function(require,module,exports){
-module.exports = function(opts) {
-  return new ElementClass(opts)
-}
-
-function indexOf(arr, prop) {
-  if (arr.indexOf) return arr.indexOf(prop)
-  for (var i = 0, len = arr.length; i < len; i++)
-    if (arr[i] === prop) return i
-  return -1
-}
-
-function ElementClass(opts) {
-  if (!(this instanceof ElementClass)) return new ElementClass(opts)
-  var self = this
-  if (!opts) opts = {}
-
-  // similar doing instanceof HTMLElement but works in IE8
-  if (opts.nodeType) opts = {el: opts}
-
-  this.opts = opts
-  this.el = opts.el || document.body
-  if (typeof this.el !== 'object') this.el = document.querySelector(this.el)
-}
-
-ElementClass.prototype.add = function(className) {
-  var el = this.el
-  if (!el) return
-  if (el.className === "") return el.className = className
-  var classes = el.className.split(' ')
-  if (indexOf(classes, className) > -1) return classes
-  classes.push(className)
-  el.className = classes.join(' ')
-  return classes
-}
-
-ElementClass.prototype.remove = function(className) {
-  var el = this.el
-  if (!el) return
-  if (el.className === "") return
-  var classes = el.className.split(' ')
-  var idx = indexOf(classes, className)
-  if (idx > -1) classes.splice(idx, 1)
-  el.className = classes.join(' ')
-  return classes
-}
-
-ElementClass.prototype.has = function(className) {
-  var el = this.el
-  if (!el) return
-  var classes = el.className.split(' ')
-  return indexOf(classes, className) > -1
-}
-
-ElementClass.prototype.toggle = function(className) {
-  var el = this.el
-  if (!el) return
-  if (this.has(className)) this.remove(className)
-  else this.add(className)
-}
-
-},{}],43:[function(require,module,exports){
+},{"./dat/color/Color.js":21,"./dat/color/interpret.js":22,"./dat/color/math.js":23,"./dat/controllers/BooleanController.js":25,"./dat/controllers/ColorController.js":26,"./dat/controllers/Controller.js":27,"./dat/controllers/FunctionController.js":28,"./dat/controllers/NumberController.js":29,"./dat/controllers/NumberControllerBox.js":30,"./dat/controllers/NumberControllerSlider.js":31,"./dat/controllers/OptionController.js":32,"./dat/controllers/StringController.js":33,"./dat/dom/dom.js":36,"./dat/gui/GUI.js":37}],43:[function(require,module,exports){
 var inserted = {};
 
 module.exports = function (css, options) {
@@ -5771,6 +5946,633 @@ function validateSubject(subject) {
 }
 
 },{}],45:[function(require,module,exports){
+module.exports = exposeProperties;
+
+/**
+ * Augments `target` object with getter/setter functions, which modify settings
+ *
+ * @example
+ *  var target = {};
+ *  exposeProperties({ age: 42}, target);
+ *  target.age(); // returns 42
+ *  target.age(24); // make age 24;
+ *
+ *  var filteredTarget = {};
+ *  exposeProperties({ age: 42, name: 'John'}, filteredTarget, ['name']);
+ *  filteredTarget.name(); // returns 'John'
+ *  filteredTarget.age === undefined; // true
+ */
+function exposeProperties(settings, target, filter) {
+  var needsFilter = Object.prototype.toString.call(filter) === '[object Array]';
+  if (needsFilter) {
+    for (var i = 0; i < filter.length; ++i) {
+      augment(settings, target, filter[i]);
+    }
+  } else {
+    for (var key in settings) {
+      augment(settings, target, key);
+    }
+  }
+}
+
+function augment(source, target, key) {
+  if (source.hasOwnProperty(key)) {
+    if (typeof target[key] === 'function') {
+      // this accessor is already defined. Ignore it
+      return;
+    }
+    target[key] = function (value) {
+      if (value !== undefined) {
+        source[key] = value;
+        return target;
+      }
+      return source[key];
+    }
+  }
+}
+
+},{}],46:[function(require,module,exports){
+module.exports = createLayout;
+module.exports.simulator = require('ngraph.physics.simulator');
+
+var eventify = require('ngraph.events');
+
+/**
+ * Creates force based layout for a given graph.
+ * @param {ngraph.graph} graph which needs to be laid out
+ * @param {object} physicsSettings if you need custom settings
+ * for physics simulator you can pass your own settings here. If it's not passed
+ * a default one will be created.
+ */
+function createLayout(graph, physicsSettings) {
+  if (!graph) {
+    throw new Error('Graph structure cannot be undefined');
+  }
+
+  var createSimulator = require('ngraph.physics.simulator');
+  var physicsSimulator = createSimulator(physicsSettings);
+
+  var nodeBodies = typeof Object.create === 'function' ? Object.create(null) : {};
+  var springs = {};
+
+  var springTransform = physicsSimulator.settings.springTransform || noop;
+
+  // Initialize physical objects according to what we have in the graph:
+  initPhysics();
+  listenToEvents();
+
+  var api = {
+    /**
+     * Performs one step of iterative layout algorithm
+     */
+    step: function() {
+      return physicsSimulator.step();
+    },
+
+    /**
+     * For a given `nodeId` returns position
+     */
+    getNodePosition: function (nodeId) {
+      return getInitializedBody(nodeId).pos;
+    },
+
+    /**
+     * Sets position of a node to a given coordinates
+     * @param {string} nodeId node identifier
+     * @param {number} x position of a node
+     * @param {number} y position of a node
+     * @param {number=} z position of node (only if applicable to body)
+     */
+    setNodePosition: function (nodeId) {
+      var body = getInitializedBody(nodeId);
+      body.setPosition.apply(body, Array.prototype.slice.call(arguments, 1));
+    },
+
+    /**
+     * @returns {Object} Link position by link id
+     * @returns {Object.from} {x, y} coordinates of link start
+     * @returns {Object.to} {x, y} coordinates of link end
+     */
+    getLinkPosition: function (linkId) {
+      var spring = springs[linkId];
+      if (spring) {
+        return {
+          from: spring.from.pos,
+          to: spring.to.pos
+        };
+      }
+    },
+
+    /**
+     * @returns {Object} area required to fit in the graph. Object contains
+     * `x1`, `y1` - top left coordinates
+     * `x2`, `y2` - bottom right coordinates
+     */
+    getGraphRect: function () {
+      return physicsSimulator.getBBox();
+    },
+
+    /*
+     * Requests layout algorithm to pin/unpin node to its current position
+     * Pinned nodes should not be affected by layout algorithm and always
+     * remain at their position
+     */
+    pinNode: function (node, isPinned) {
+      var body = getInitializedBody(node.id);
+       body.isPinned = !!isPinned;
+    },
+
+    /**
+     * Checks whether given graph's node is currently pinned
+     */
+    isNodePinned: function (node) {
+      return getInitializedBody(node.id).isPinned;
+    },
+
+    /**
+     * Request to release all resources
+     */
+    dispose: function() {
+      graph.off('changed', onGraphChanged);
+      physicsSimulator.off('stable', onStableChanged);
+    },
+
+    /**
+     * Gets physical body for a given node id. If node is not found undefined
+     * value is returned.
+     */
+    getBody: getBody,
+
+    /**
+     * Gets spring for a given edge.
+     *
+     * @param {string} linkId link identifer. If two arguments are passed then
+     * this argument is treated as formNodeId
+     * @param {string=} toId when defined this parameter denotes head of the link
+     * and first argument is trated as tail of the link (fromId)
+     */
+    getSpring: getSpring,
+
+    /**
+     * [Read only] Gets current physics simulator
+     */
+    simulator: physicsSimulator
+  };
+
+  eventify(api);
+  return api;
+
+  function getSpring(fromId, toId) {
+    var linkId;
+    if (toId === undefined) {
+      if (typeof fromId !== 'object') {
+        // assume fromId as a linkId:
+        linkId = fromId;
+      } else {
+        // assume fromId to be a link object:
+        linkId = fromId.id;
+      }
+    } else {
+      // toId is defined, should grab link:
+      var link = graph.hasLink(fromId, toId);
+      if (!link) return;
+      linkId = link.id;
+    }
+
+    return springs[linkId];
+  }
+
+  function getBody(nodeId) {
+    return nodeBodies[nodeId];
+  }
+
+  function listenToEvents() {
+    graph.on('changed', onGraphChanged);
+    physicsSimulator.on('stable', onStableChanged);
+  }
+
+  function onStableChanged(isStable) {
+    api.fire('stable', isStable);
+  }
+
+  function onGraphChanged(changes) {
+    for (var i = 0; i < changes.length; ++i) {
+      var change = changes[i];
+      if (change.changeType === 'add') {
+        if (change.node) {
+          initBody(change.node.id);
+        }
+        if (change.link) {
+          initLink(change.link);
+        }
+      } else if (change.changeType === 'remove') {
+        if (change.node) {
+          releaseNode(change.node);
+        }
+        if (change.link) {
+          releaseLink(change.link);
+        }
+      }
+    }
+  }
+
+  function initPhysics() {
+    graph.forEachNode(function (node) {
+      initBody(node.id);
+    });
+    graph.forEachLink(initLink);
+  }
+
+  function initBody(nodeId) {
+    var body = nodeBodies[nodeId];
+    if (!body) {
+      var node = graph.getNode(nodeId);
+      if (!node) {
+        throw new Error('initBody() was called with unknown node id');
+      }
+
+      var pos = node.position;
+      if (!pos) {
+        var neighbors = getNeighborBodies(node);
+        pos = physicsSimulator.getBestNewBodyPosition(neighbors);
+      }
+
+      body = physicsSimulator.addBodyAt(pos);
+
+      nodeBodies[nodeId] = body;
+      updateBodyMass(nodeId);
+
+      if (isNodeOriginallyPinned(node)) {
+        body.isPinned = true;
+      }
+    }
+  }
+
+  function releaseNode(node) {
+    var nodeId = node.id;
+    var body = nodeBodies[nodeId];
+    if (body) {
+      nodeBodies[nodeId] = null;
+      delete nodeBodies[nodeId];
+
+      physicsSimulator.removeBody(body);
+    }
+  }
+
+  function initLink(link) {
+    updateBodyMass(link.fromId);
+    updateBodyMass(link.toId);
+
+    var fromBody = nodeBodies[link.fromId],
+        toBody  = nodeBodies[link.toId],
+        spring = physicsSimulator.addSpring(fromBody, toBody, link.length);
+
+    springTransform(link, spring);
+
+    springs[link.id] = spring;
+  }
+
+  function releaseLink(link) {
+    var spring = springs[link.id];
+    if (spring) {
+      var from = graph.getNode(link.fromId),
+          to = graph.getNode(link.toId);
+
+      if (from) updateBodyMass(from.id);
+      if (to) updateBodyMass(to.id);
+
+      delete springs[link.id];
+
+      physicsSimulator.removeSpring(spring);
+    }
+  }
+
+  function getNeighborBodies(node) {
+    // TODO: Could probably be done better on memory
+    var neighbors = [];
+    if (!node.links) {
+      return neighbors;
+    }
+    var maxNeighbors = Math.min(node.links.length, 2);
+    for (var i = 0; i < maxNeighbors; ++i) {
+      var link = node.links[i];
+      var otherBody = link.fromId !== node.id ? nodeBodies[link.fromId] : nodeBodies[link.toId];
+      if (otherBody && otherBody.pos) {
+        neighbors.push(otherBody);
+      }
+    }
+
+    return neighbors;
+  }
+
+  function updateBodyMass(nodeId) {
+    var body = nodeBodies[nodeId];
+    body.mass = nodeMass(nodeId);
+  }
+
+  /**
+   * Checks whether graph node has in its settings pinned attribute,
+   * which means layout algorithm cannot move it. Node can be preconfigured
+   * as pinned, if it has "isPinned" attribute, or when node.data has it.
+   *
+   * @param {Object} node a graph node to check
+   * @return {Boolean} true if node should be treated as pinned; false otherwise.
+   */
+  function isNodeOriginallyPinned(node) {
+    return (node && (node.isPinned || (node.data && node.data.isPinned)));
+  }
+
+  function getInitializedBody(nodeId) {
+    var body = nodeBodies[nodeId];
+    if (!body) {
+      initBody(nodeId);
+      body = nodeBodies[nodeId];
+    }
+    return body;
+  }
+
+  /**
+   * Calculates mass of a body, which corresponds to node with given id.
+   *
+   * @param {String|Number} nodeId identifier of a node, for which body mass needs to be calculated
+   * @returns {Number} recommended mass of the body;
+   */
+  function nodeMass(nodeId) {
+    var links = graph.getLinks(nodeId);
+    if (!links) return 1;
+    return 1 + links.length / 3.0;
+  }
+}
+
+function noop() { }
+
+},{"ngraph.events":44,"ngraph.physics.simulator":57}],47:[function(require,module,exports){
+/**
+ * This module provides all required forces to regular ngraph.physics.simulator
+ * to make it 3D simulator. Ideally ngraph.physics.simulator should operate
+ * with vectors, but on practices that showed performance decrease... Maybe
+ * I was doing it wrong, will see if I can refactor/throw away this module.
+ */
+module.exports = createLayout;
+createLayout.get2dLayout = require('ngraph.forcelayout');
+
+function createLayout(graph, physicsSettings) {
+  var merge = require('ngraph.merge');
+  physicsSettings = merge(physicsSettings, {
+        createQuadTree: require('ngraph.quadtreebh3d'),
+        createBounds: require('./lib/bounds'),
+        createDragForce: require('./lib/dragForce'),
+        createSpringForce: require('./lib/springForce'),
+        integrator: require('./lib/eulerIntegrator'),
+        createBody: require('./lib/createBody')
+      });
+
+  return createLayout.get2dLayout(graph, physicsSettings);
+}
+
+},{"./lib/bounds":48,"./lib/createBody":49,"./lib/dragForce":50,"./lib/eulerIntegrator":51,"./lib/springForce":52,"ngraph.forcelayout":46,"ngraph.merge":55,"ngraph.quadtreebh3d":68}],48:[function(require,module,exports){
+module.exports = function (bodies, settings) {
+  var random = require('ngraph.random').random(42);
+  var boundingBox =  { x1: 0, y1: 0, z1: 0, x2: 0, y2: 0, z2: 0 };
+
+  return {
+    box: boundingBox,
+
+    update: updateBoundingBox,
+
+    reset : function () {
+      boundingBox.x1 = boundingBox.y1 = 0;
+      boundingBox.x2 = boundingBox.y2 = 0;
+      boundingBox.z1 = boundingBox.z2 = 0;
+    },
+
+    getBestNewPosition: function (neighbors) {
+      var graphRect = boundingBox;
+
+      var baseX = 0, baseY = 0, baseZ = 0;
+
+      if (neighbors.length) {
+        for (var i = 0; i < neighbors.length; ++i) {
+          baseX += neighbors[i].pos.x;
+          baseY += neighbors[i].pos.y;
+          baseZ += neighbors[i].pos.z;
+        }
+
+        baseX /= neighbors.length;
+        baseY /= neighbors.length;
+        baseZ /= neighbors.length;
+      } else {
+        baseX = (graphRect.x1 + graphRect.x2) / 2;
+        baseY = (graphRect.y1 + graphRect.y2) / 2;
+        baseZ = (graphRect.z1 + graphRect.z2) / 2;
+      }
+
+      var springLength = settings.springLength;
+      return {
+        x: baseX + random.next(springLength) - springLength / 2,
+        y: baseY + random.next(springLength) - springLength / 2,
+        z: baseZ + random.next(springLength) - springLength / 2
+      };
+    }
+  };
+
+  function updateBoundingBox() {
+    var i = bodies.length;
+    if (i === 0) { return; } // don't have to wory here.
+
+    var x1 = Number.MAX_VALUE,
+        y1 = Number.MAX_VALUE,
+        z1 = Number.MAX_VALUE,
+        x2 = Number.MIN_VALUE,
+        y2 = Number.MIN_VALUE,
+        z2 = Number.MIN_VALUE;
+
+    while(i--) {
+      // this is O(n), could it be done faster with quadtree?
+      // how about pinned nodes?
+      var body = bodies[i];
+      if (body.isPinned) {
+        body.pos.x = body.prevPos.x;
+        body.pos.y = body.prevPos.y;
+        body.pos.z = body.prevPos.z;
+      } else {
+        body.prevPos.x = body.pos.x;
+        body.prevPos.y = body.pos.y;
+        body.prevPos.z = body.pos.z;
+      }
+      if (body.pos.x < x1) {
+        x1 = body.pos.x;
+      }
+      if (body.pos.x > x2) {
+        x2 = body.pos.x;
+      }
+      if (body.pos.y < y1) {
+        y1 = body.pos.y;
+      }
+      if (body.pos.y > y2) {
+        y2 = body.pos.y;
+      }
+      if (body.pos.z < z1) {
+        z1 = body.pos.z;
+      }
+      if (body.pos.z > z2) {
+        z2 = body.pos.z;
+      }
+    }
+
+    boundingBox.x1 = x1;
+    boundingBox.x2 = x2;
+    boundingBox.y1 = y1;
+    boundingBox.y2 = y2;
+    boundingBox.z1 = z1;
+    boundingBox.z2 = z2;
+  }
+};
+
+},{"ngraph.random":72}],49:[function(require,module,exports){
+var physics = require('ngraph.physics.primitives');
+
+module.exports = function(pos) {
+  return new physics.Body3d(pos);
+}
+
+},{"ngraph.physics.primitives":56}],50:[function(require,module,exports){
+/**
+ * Represents 3d drag force, which reduces force value on each step by given
+ * coefficient.
+ *
+ * @param {Object} options for the drag force
+ * @param {Number=} options.dragCoeff drag force coefficient. 0.1 by default
+ */
+module.exports = function (options) {
+  var merge = require('ngraph.merge'),
+      expose = require('ngraph.expose');
+
+  options = merge(options, {
+    dragCoeff: 0.02
+  });
+
+  var api = {
+    update : function (body) {
+      body.force.x -= options.dragCoeff * body.velocity.x;
+      body.force.y -= options.dragCoeff * body.velocity.y;
+      body.force.z -= options.dragCoeff * body.velocity.z;
+    }
+  };
+
+  // let easy access to dragCoeff:
+  expose(options, api, ['dragCoeff']);
+
+  return api;
+};
+
+},{"ngraph.expose":45,"ngraph.merge":55}],51:[function(require,module,exports){
+/**
+ * Performs 3d forces integration, using given timestep. Uses Euler method to solve
+ * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
+ *
+ * @returns {Number} squared distance of total position updates.
+ */
+
+module.exports = integrate;
+
+function integrate(bodies, timeStep) {
+  var dx = 0, tx = 0,
+      dy = 0, ty = 0,
+      dz = 0, tz = 0,
+      i,
+      max = bodies.length;
+
+  for (i = 0; i < max; ++i) {
+    var body = bodies[i],
+        coeff = timeStep / body.mass;
+
+    body.velocity.x += coeff * body.force.x;
+    body.velocity.y += coeff * body.force.y;
+    body.velocity.z += coeff * body.force.z;
+
+    var vx = body.velocity.x,
+        vy = body.velocity.y,
+        vz = body.velocity.z,
+        v = Math.sqrt(vx * vx + vy * vy + vz * vz);
+
+    if (v > 1) {
+      body.velocity.x = vx / v;
+      body.velocity.y = vy / v;
+      body.velocity.z = vz / v;
+    }
+
+    dx = timeStep * body.velocity.x;
+    dy = timeStep * body.velocity.y;
+    dz = timeStep * body.velocity.z;
+
+    body.pos.x += dx;
+    body.pos.y += dy;
+    body.pos.z += dz;
+
+    tx += Math.abs(dx); ty += Math.abs(dy); tz += Math.abs(dz);
+  }
+
+  return (tx * tx + ty * ty + tz * tz)/bodies.length;
+}
+
+},{}],52:[function(require,module,exports){
+/**
+ * Represents 3d spring force, which updates forces acting on two bodies, conntected
+ * by a spring.
+ *
+ * @param {Object} options for the spring force
+ * @param {Number=} options.springCoeff spring force coefficient.
+ * @param {Number=} options.springLength desired length of a spring at rest.
+ */
+module.exports = function (options) {
+  var merge = require('ngraph.merge');
+  var random = require('ngraph.random').random(42);
+  var expose = require('ngraph.expose');
+
+  options = merge(options, {
+    springCoeff: 0.0002,
+    springLength: 80
+  });
+
+  var api = {
+    /**
+     * Upsates forces acting on a spring
+     */
+    update : function (spring) {
+      var body1 = spring.from,
+          body2 = spring.to,
+          length = spring.length < 0 ? options.springLength : spring.length,
+          dx = body2.pos.x - body1.pos.x,
+          dy = body2.pos.y - body1.pos.y,
+          dz = body2.pos.z - body1.pos.z,
+          r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      if (r === 0) {
+          dx = (random.nextDouble() - 0.5) / 50;
+          dy = (random.nextDouble() - 0.5) / 50;
+          dz = (random.nextDouble() - 0.5) / 50;
+          r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      }
+
+      var d = r - length;
+      var coeff = ((!spring.coeff || spring.coeff < 0) ? options.springCoeff : spring.coeff) * d / r * spring.weight;
+
+      body1.force.x += coeff * dx;
+      body1.force.y += coeff * dy;
+      body1.force.z += coeff * dz;
+
+      body2.force.x -= coeff * dx;
+      body2.force.y -= coeff * dy;
+      body2.force.z -= coeff * dz;
+    }
+  };
+
+  expose(options, api, ['springCoeff', 'springLength']);
+  return api;
+}
+
+},{"ngraph.expose":45,"ngraph.merge":55,"ngraph.random":72}],53:[function(require,module,exports){
 module.exports = {
   ladder: ladder,
   complete: complete,
@@ -6071,7 +6873,7 @@ function wattsStrogatz(n, k, p, seed) {
   return g;
 }
 
-},{"ngraph.graph":46,"ngraph.random":47}],46:[function(require,module,exports){
+},{"ngraph.graph":54,"ngraph.random":72}],54:[function(require,module,exports){
 /**
  * @fileOverview Contains definition of the core graph object.
  */
@@ -6650,864 +7452,107 @@ function makeLinkId(fromId, toId) {
   return hashCode(fromId.toString() + '👉 ' + toId.toString());
 }
 
-},{"ngraph.events":44}],47:[function(require,module,exports){
-module.exports = {
-  random: random,
-  randomIterator: randomIterator
-};
+},{"ngraph.events":44}],55:[function(require,module,exports){
+module.exports = merge;
 
 /**
- * Creates seeded PRNG with two methods:
- *   next() and nextDouble()
+ * Augments `target` with properties in `options`. Does not override
+ * target's properties if they are defined and matches expected type in 
+ * options
+ *
+ * @returns {Object} merged object
  */
-function random(inputSeed) {
-  var seed = typeof inputSeed === 'number' ? inputSeed : (+ new Date());
-  var randomFunc = function() {
-      // Robert Jenkins' 32 bit integer hash function.
-      seed = ((seed + 0x7ed55d16) + (seed << 12))  & 0xffffffff;
-      seed = ((seed ^ 0xc761c23c) ^ (seed >>> 19)) & 0xffffffff;
-      seed = ((seed + 0x165667b1) + (seed << 5))   & 0xffffffff;
-      seed = ((seed + 0xd3a2646c) ^ (seed << 9))   & 0xffffffff;
-      seed = ((seed + 0xfd7046c5) + (seed << 3))   & 0xffffffff;
-      seed = ((seed ^ 0xb55a4f09) ^ (seed >>> 16)) & 0xffffffff;
-      return (seed & 0xfffffff) / 0x10000000;
-  };
+function merge(target, options) {
+  var key;
+  if (!target) { target = {}; }
+  if (options) {
+    for (key in options) {
+      if (options.hasOwnProperty(key)) {
+        var targetHasIt = target.hasOwnProperty(key),
+            optionsValueType = typeof options[key],
+            shouldReplace = !targetHasIt || (typeof target[key] !== optionsValueType);
 
-  return {
-      /**
-       * Generates random integer number in the range from 0 (inclusive) to maxValue (exclusive)
-       *
-       * @param maxValue Number REQUIRED. Ommitting this number will result in NaN values from PRNG.
-       */
-      next : function (maxValue) {
-          return Math.floor(randomFunc() * maxValue);
-      },
-
-      /**
-       * Generates random double number in the range from 0 (inclusive) to 1 (exclusive)
-       * This function is the same as Math.random() (except that it could be seeded)
-       */
-      nextDouble : function () {
-          return randomFunc();
-      }
-  };
-}
-
-/*
- * Creates iterator over array, which returns items of array in random order
- * Time complexity is guaranteed to be O(n);
- */
-function randomIterator(array, customRandom) {
-    var localRandom = customRandom || random();
-    if (typeof localRandom.next !== 'function') {
-      throw new Error('customRandom does not match expected API: next() function is missing');
-    }
-
-    return {
-        forEach : function (callback) {
-            var i, j, t;
-            for (i = array.length - 1; i > 0; --i) {
-                j = localRandom.next(i + 1); // i inclusive
-                t = array[j];
-                array[j] = array[i];
-                array[i] = t;
-
-                callback(t);
-            }
-
-            if (array.length) {
-                callback(array[0]);
-            }
-        },
-
-        /**
-         * Shuffles array randomly, in place.
-         */
-        shuffle : function () {
-            var i, j, t;
-            for (i = array.length - 1; i > 0; --i) {
-                j = localRandom.next(i + 1); // i inclusive
-                t = array[j];
-                array[j] = array[i];
-                array[i] = t;
-            }
-
-            return array;
+        if (shouldReplace) {
+          target[key] = options[key];
+        } else if (optionsValueType === 'object') {
+          // go deep, don't care about loops here, we are simple API!:
+          target[key] = merge(target[key], options[key]);
         }
-    };
-}
-
-},{}],48:[function(require,module,exports){
-/**
- * Creates a force based layout that can be switched between 3d and 2d modes
- * Layout is used by ngraph.pixel
- *
- * @param {ngraph.graph} graph instance that needs to be laid out
- * @param {object} options - configures current layout.
- * @returns {ojbect} api to operate with current layout. Only two methods required
- * to exist by ngraph.pixel: `step()` and `getNodePosition()`.
- */
-var eventify = require('ngraph.events');
-var layout3d = require('ngraph.forcelayout3d');
-var layout2d = layout3d.get2dLayout;
-
-module.exports = createLayout;
-
-function createLayout(graph, options) {
-  options = options || {};
-
-  /**
-   * Shuold the graph be rendered in 3d space? True by default
-   */
-  options.is3d = options.is3d === undefined ? true : options.is3d;
-
-  var is3d = options.is3d;
-  var layout = is3d ? layout3d(graph, options.physics) : layout2d(graph, options.physics);
-
-  var api = {
-    ////////////////////////////////////////////////////////////////////////////
-    // The following two methods are required by ngraph.pixel to be implemented
-    // by all layout providers
-    ////////////////////////////////////////////////////////////////////////////
-
-    /**
-     * Called by `ngraph.pixel` to perform one step. Required to be provided by
-     * all layout interfaces.
-     */
-    step: layout.step,
-
-    /**
-     * Gets position of a given node by its identifier. Required.
-     *
-     * @param {string} nodeId identifier of a node in question.
-     * @returns {object} {x: number, y: number, z: number} coordinates of a node.
-     */
-    getNodePosition: layout.getNodePosition,
-
-    ////////////////////////////////////////////////////////////////////////////
-    // Methods below are not required by ngraph.pixel, and are specific to the
-    // current layout implementation
-    ////////////////////////////////////////////////////////////////////////////
-
-    /**
-     * Sets position for a given node by its identifier.
-     *
-     * @param {string} nodeId identifier of a node that we want to modify
-     * @param {number} x coordinate of a node
-     * @param {number} y coordinate of a node
-     * @param {number} z coordinate of a node
-     */
-    setNodePosition: layout.setNodePosition,
-
-    /**
-     * Toggle rendering mode between 2d and 3d.
-     *
-     * @param {boolean+} newMode if set to true, the renderer will switch to 3d
-     * rendering mode. If set to false, the renderer will switch to 2d mode.
-     * Finally if this argument is not defined, then current rendering mode is
-     * returned.
-     */
-    is3d: mode3d,
-
-    /**
-     * Gets force based simulator of the current layout
-     */
-    simulator: layout.simulator,
-
-    /**
-     * Toggle node pinning. If node is pinned the layout algorithm is not allowed
-     * to change its position.
-     *
-     * @param {string} nodeId identifier of a node to work with;
-     * @param {boolean+} isPinned if specified then the `nodeId` pinning attribute
-     * is set to the to the value of this argument; Otherwise this method returns
-     * current pinning mode of the node.
-     */
-    pinNode: pinNode
-  };
-
-  eventify(api);
-
-  return api;
-
-  function mode3d(newMode) {
-    if (newMode === undefined) {
-      return is3d;
-    }
-    if (newMode !== is3d) {
-      toggleLayout();
-    }
-    return api;
-  }
-
-  function toggleLayout() {
-    var idx = 0;
-    var oldLayout = layout;
-    layout.dispose();
-    is3d = !is3d;
-    var physics = copyPhysicsSettings(layout.simulator);
-
-    if (is3d) {
-      layout = layout3d(graph, physics);
-    } else {
-      layout = layout2d(graph, physics);
-    }
-    graph.forEachNode(initLayout);
-    api.step = layout.step;
-    api.setNodePosition = layout.setNodePosition;
-    api.getNodePosition = layout.getNodePosition;
-    api.simulator = layout.simulator;
-
-    api.fire('reset');
-
-    function initLayout(node) {
-      var pos = oldLayout.getNodePosition(node.id);
-      // we need to bump 3d positions, so that forces are disturbed:
-      if (is3d) pos.z = (idx % 2 === 0) ? -1 : 1;
-      else pos.z = 0;
-      layout.setNodePosition(node.id, pos.x, pos.y, pos.z);
-      idx += 1;
+      }
     }
   }
 
-  function pinNode(nodeId, isPinned) {
-    var node = graph.getNode(nodeId);
-    if (!node) throw new Error('Could not find node in the graph. Node Id: ' + nodeId);
-    if (isPinned === undefined) {
-      return layout.isNodePinned(node);
-    }
-    layout.pinNode(node, isPinned);
-  }
-
-  function copyPhysicsSettings(simulator) {
-    return {
-      springLength: simulator.springLength(),
-      springCoeff: simulator.springCoeff(),
-      gravity: simulator.gravity(),
-      theta: simulator.theta(),
-      dragCoeff: simulator.dragCoeff(),
-      timeStep: simulator.timeStep()
-    };
-  }
-}
-
-},{"ngraph.events":44,"ngraph.forcelayout3d":49}],49:[function(require,module,exports){
-/**
- * This module provides all required forces to regular ngraph.physics.simulator
- * to make it 3D simulator. Ideally ngraph.physics.simulator should operate
- * with vectors, but on practices that showed performance decrease... Maybe
- * I was doing it wrong, will see if I can refactor/throw away this module.
- */
-module.exports = createLayout;
-createLayout.get2dLayout = require('ngraph.forcelayout');
-
-function createLayout(graph, physicsSettings) {
-  var merge = require('ngraph.merge');
-  physicsSettings = merge(physicsSettings, {
-        createQuadTree: require('ngraph.quadtreebh3d'),
-        createBounds: require('./lib/bounds'),
-        createDragForce: require('./lib/dragForce'),
-        createSpringForce: require('./lib/springForce'),
-        integrator: require('./lib/eulerIntegrator'),
-        createBody: require('./lib/createBody')
-      });
-
-  return createLayout.get2dLayout(graph, physicsSettings);
-}
-
-},{"./lib/bounds":50,"./lib/createBody":51,"./lib/dragForce":52,"./lib/eulerIntegrator":53,"./lib/springForce":54,"ngraph.forcelayout":56,"ngraph.merge":68,"ngraph.quadtreebh3d":70}],50:[function(require,module,exports){
-module.exports = function (bodies, settings) {
-  var random = require('ngraph.random').random(42);
-  var boundingBox =  { x1: 0, y1: 0, z1: 0, x2: 0, y2: 0, z2: 0 };
-
-  return {
-    box: boundingBox,
-
-    update: updateBoundingBox,
-
-    reset : function () {
-      boundingBox.x1 = boundingBox.y1 = 0;
-      boundingBox.x2 = boundingBox.y2 = 0;
-      boundingBox.z1 = boundingBox.z2 = 0;
-    },
-
-    getBestNewPosition: function (neighbors) {
-      var graphRect = boundingBox;
-
-      var baseX = 0, baseY = 0, baseZ = 0;
-
-      if (neighbors.length) {
-        for (var i = 0; i < neighbors.length; ++i) {
-          baseX += neighbors[i].pos.x;
-          baseY += neighbors[i].pos.y;
-          baseZ += neighbors[i].pos.z;
-        }
-
-        baseX /= neighbors.length;
-        baseY /= neighbors.length;
-        baseZ /= neighbors.length;
-      } else {
-        baseX = (graphRect.x1 + graphRect.x2) / 2;
-        baseY = (graphRect.y1 + graphRect.y2) / 2;
-        baseZ = (graphRect.z1 + graphRect.z2) / 2;
-      }
-
-      var springLength = settings.springLength;
-      return {
-        x: baseX + random.next(springLength) - springLength / 2,
-        y: baseY + random.next(springLength) - springLength / 2,
-        z: baseZ + random.next(springLength) - springLength / 2
-      };
-    }
-  };
-
-  function updateBoundingBox() {
-    var i = bodies.length;
-    if (i === 0) { return; } // don't have to wory here.
-
-    var x1 = Number.MAX_VALUE,
-        y1 = Number.MAX_VALUE,
-        z1 = Number.MAX_VALUE,
-        x2 = Number.MIN_VALUE,
-        y2 = Number.MIN_VALUE,
-        z2 = Number.MIN_VALUE;
-
-    while(i--) {
-      // this is O(n), could it be done faster with quadtree?
-      // how about pinned nodes?
-      var body = bodies[i];
-      if (body.isPinned) {
-        body.pos.x = body.prevPos.x;
-        body.pos.y = body.prevPos.y;
-        body.pos.z = body.prevPos.z;
-      } else {
-        body.prevPos.x = body.pos.x;
-        body.prevPos.y = body.pos.y;
-        body.prevPos.z = body.pos.z;
-      }
-      if (body.pos.x < x1) {
-        x1 = body.pos.x;
-      }
-      if (body.pos.x > x2) {
-        x2 = body.pos.x;
-      }
-      if (body.pos.y < y1) {
-        y1 = body.pos.y;
-      }
-      if (body.pos.y > y2) {
-        y2 = body.pos.y;
-      }
-      if (body.pos.z < z1) {
-        z1 = body.pos.z;
-      }
-      if (body.pos.z > z2) {
-        z2 = body.pos.z;
-      }
-    }
-
-    boundingBox.x1 = x1;
-    boundingBox.x2 = x2;
-    boundingBox.y1 = y1;
-    boundingBox.y2 = y2;
-    boundingBox.z1 = z1;
-    boundingBox.z2 = z2;
-  }
-};
-
-},{"ngraph.random":74}],51:[function(require,module,exports){
-var physics = require('ngraph.physics.primitives');
-
-module.exports = function(pos) {
-  return new physics.Body3d(pos);
-}
-
-},{"ngraph.physics.primitives":69}],52:[function(require,module,exports){
-/**
- * Represents 3d drag force, which reduces force value on each step by given
- * coefficient.
- *
- * @param {Object} options for the drag force
- * @param {Number=} options.dragCoeff drag force coefficient. 0.1 by default
- */
-module.exports = function (options) {
-  var merge = require('ngraph.merge'),
-      expose = require('ngraph.expose');
-
-  options = merge(options, {
-    dragCoeff: 0.02
-  });
-
-  var api = {
-    update : function (body) {
-      body.force.x -= options.dragCoeff * body.velocity.x;
-      body.force.y -= options.dragCoeff * body.velocity.y;
-      body.force.z -= options.dragCoeff * body.velocity.z;
-    }
-  };
-
-  // let easy access to dragCoeff:
-  expose(options, api, ['dragCoeff']);
-
-  return api;
-};
-
-},{"ngraph.expose":55,"ngraph.merge":68}],53:[function(require,module,exports){
-/**
- * Performs 3d forces integration, using given timestep. Uses Euler method to solve
- * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
- *
- * @returns {Number} squared distance of total position updates.
- */
-
-module.exports = integrate;
-
-function integrate(bodies, timeStep) {
-  var dx = 0, tx = 0,
-      dy = 0, ty = 0,
-      dz = 0, tz = 0,
-      i,
-      max = bodies.length;
-
-  for (i = 0; i < max; ++i) {
-    var body = bodies[i],
-        coeff = timeStep / body.mass;
-
-    body.velocity.x += coeff * body.force.x;
-    body.velocity.y += coeff * body.force.y;
-    body.velocity.z += coeff * body.force.z;
-
-    var vx = body.velocity.x,
-        vy = body.velocity.y,
-        vz = body.velocity.z,
-        v = Math.sqrt(vx * vx + vy * vy + vz * vz);
-
-    if (v > 1) {
-      body.velocity.x = vx / v;
-      body.velocity.y = vy / v;
-      body.velocity.z = vz / v;
-    }
-
-    dx = timeStep * body.velocity.x;
-    dy = timeStep * body.velocity.y;
-    dz = timeStep * body.velocity.z;
-
-    body.pos.x += dx;
-    body.pos.y += dy;
-    body.pos.z += dz;
-
-    tx += Math.abs(dx); ty += Math.abs(dy); tz += Math.abs(dz);
-  }
-
-  return (tx * tx + ty * ty + tz * tz)/bodies.length;
-}
-
-},{}],54:[function(require,module,exports){
-/**
- * Represents 3d spring force, which updates forces acting on two bodies, conntected
- * by a spring.
- *
- * @param {Object} options for the spring force
- * @param {Number=} options.springCoeff spring force coefficient.
- * @param {Number=} options.springLength desired length of a spring at rest.
- */
-module.exports = function (options) {
-  var merge = require('ngraph.merge');
-  var random = require('ngraph.random').random(42);
-  var expose = require('ngraph.expose');
-
-  options = merge(options, {
-    springCoeff: 0.0002,
-    springLength: 80
-  });
-
-  var api = {
-    /**
-     * Upsates forces acting on a spring
-     */
-    update : function (spring) {
-      var body1 = spring.from,
-          body2 = spring.to,
-          length = spring.length < 0 ? options.springLength : spring.length,
-          dx = body2.pos.x - body1.pos.x,
-          dy = body2.pos.y - body1.pos.y,
-          dz = body2.pos.z - body1.pos.z,
-          r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-      if (r === 0) {
-          dx = (random.nextDouble() - 0.5) / 50;
-          dy = (random.nextDouble() - 0.5) / 50;
-          dz = (random.nextDouble() - 0.5) / 50;
-          r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      }
-
-      var d = r - length;
-      var coeff = ((!spring.coeff || spring.coeff < 0) ? options.springCoeff : spring.coeff) * d / r * spring.weight;
-
-      body1.force.x += coeff * dx;
-      body1.force.y += coeff * dy;
-      body1.force.z += coeff * dz;
-
-      body2.force.x -= coeff * dx;
-      body2.force.y -= coeff * dy;
-      body2.force.z -= coeff * dz;
-    }
-  };
-
-  expose(options, api, ['springCoeff', 'springLength']);
-  return api;
-}
-
-},{"ngraph.expose":55,"ngraph.merge":68,"ngraph.random":74}],55:[function(require,module,exports){
-module.exports = exposeProperties;
-
-/**
- * Augments `target` object with getter/setter functions, which modify settings
- *
- * @example
- *  var target = {};
- *  exposeProperties({ age: 42}, target);
- *  target.age(); // returns 42
- *  target.age(24); // make age 24;
- *
- *  var filteredTarget = {};
- *  exposeProperties({ age: 42, name: 'John'}, filteredTarget, ['name']);
- *  filteredTarget.name(); // returns 'John'
- *  filteredTarget.age === undefined; // true
- */
-function exposeProperties(settings, target, filter) {
-  var needsFilter = Object.prototype.toString.call(filter) === '[object Array]';
-  if (needsFilter) {
-    for (var i = 0; i < filter.length; ++i) {
-      augment(settings, target, filter[i]);
-    }
-  } else {
-    for (var key in settings) {
-      augment(settings, target, key);
-    }
-  }
-}
-
-function augment(source, target, key) {
-  if (source.hasOwnProperty(key)) {
-    if (typeof target[key] === 'function') {
-      // this accessor is already defined. Ignore it
-      return;
-    }
-    target[key] = function (value) {
-      if (value !== undefined) {
-        source[key] = value;
-        return target;
-      }
-      return source[key];
-    }
-  }
+  return target;
 }
 
 },{}],56:[function(require,module,exports){
-module.exports = createLayout;
-module.exports.simulator = require('ngraph.physics.simulator');
+module.exports = {
+  Body: Body,
+  Vector2d: Vector2d,
+  Body3d: Body3d,
+  Vector3d: Vector3d
+};
 
-/**
- * Creates force based layout for a given graph.
- * @param {ngraph.graph} graph which needs to be laid out
- * @param {object} physicsSettings if you need custom settings
- * for physics simulator you can pass your own settings here. If it's not passed
- * a default one will be created.
- */
-function createLayout(graph, physicsSettings) {
-  if (!graph) {
-    throw new Error('Graph structure cannot be undefined');
-  }
+function Body(x, y) {
+  this.pos = new Vector2d(x, y);
+  this.prevPos = new Vector2d(x, y);
+  this.force = new Vector2d();
+  this.velocity = new Vector2d();
+  this.mass = 1;
+}
 
-  var createSimulator = require('ngraph.physics.simulator');
-  var physicsSimulator = createSimulator(physicsSettings);
+Body.prototype.setPosition = function (x, y) {
+  this.prevPos.x = this.pos.x = x;
+  this.prevPos.y = this.pos.y = y;
+};
 
-  var nodeBodies = typeof Object.create === 'function' ? Object.create(null) : {};
-  var springs = {};
-
-  var springTransform = physicsSimulator.settings.springTransform || noop;
-
-  // Initialize physical objects according to what we have in the graph:
-  initPhysics();
-  listenToGraphEvents();
-
-  var api = {
-    /**
-     * Performs one step of iterative layout algorithm
-     */
-    step: function() {
-      return physicsSimulator.step();
-    },
-
-    /**
-     * For a given `nodeId` returns position
-     */
-    getNodePosition: function (nodeId) {
-      return getInitializedBody(nodeId).pos;
-    },
-
-    /**
-     * Sets position of a node to a given coordinates
-     * @param {string} nodeId node identifier
-     * @param {number} x position of a node
-     * @param {number} y position of a node
-     * @param {number=} z position of node (only if applicable to body)
-     */
-    setNodePosition: function (nodeId) {
-      var body = getInitializedBody(nodeId);
-      body.setPosition.apply(body, Array.prototype.slice.call(arguments, 1));
-    },
-
-    /**
-     * @returns {Object} Link position by link id
-     * @returns {Object.from} {x, y} coordinates of link start
-     * @returns {Object.to} {x, y} coordinates of link end
-     */
-    getLinkPosition: function (linkId) {
-      var spring = springs[linkId];
-      if (spring) {
-        return {
-          from: spring.from.pos,
-          to: spring.to.pos
-        };
-      }
-    },
-
-    /**
-     * @returns {Object} area required to fit in the graph. Object contains
-     * `x1`, `y1` - top left coordinates
-     * `x2`, `y2` - bottom right coordinates
-     */
-    getGraphRect: function () {
-      return physicsSimulator.getBBox();
-    },
-
-    /*
-     * Requests layout algorithm to pin/unpin node to its current position
-     * Pinned nodes should not be affected by layout algorithm and always
-     * remain at their position
-     */
-    pinNode: function (node, isPinned) {
-      var body = getInitializedBody(node.id);
-       body.isPinned = !!isPinned;
-    },
-
-    /**
-     * Checks whether given graph's node is currently pinned
-     */
-    isNodePinned: function (node) {
-      return getInitializedBody(node.id).isPinned;
-    },
-
-    /**
-     * Request to release all resources
-     */
-    dispose: function() {
-      graph.off('changed', onGraphChanged);
-    },
-
-    /**
-     * Gets physical body for a given node id. If node is not found undefined
-     * value is returned.
-     */
-    getBody: getBody,
-
-    /**
-     * Gets spring for a given edge.
-     *
-     * @param {string} linkId link identifer. If two arguments are passed then
-     * this argument is treated as formNodeId
-     * @param {string=} toId when defined this parameter denotes head of the link
-     * and first argument is trated as tail of the link (fromId)
-     */
-    getSpring: getSpring,
-
-    /**
-     * [Read only] Gets current physics simulator
-     */
-    simulator: physicsSimulator
-  };
-
-  return api;
-
-  function getSpring(fromId, toId) {
-    var linkId;
-    if (toId === undefined) {
-      if (typeof fromId === 'string') {
-        // assume fromId as a linkId:
-        linkId = fromId;
-      } else {
-        // assume fromId to be a link object:
-        linkId = fromId.id;
-      }
-    } else {
-      // toId is defined, should grab link:
-      var link = graph.hasLink(fromId, toId);
-      if (!link) return;
-      linkId = link.id;
-    }
-
-    return springs[linkId];
-  }
-
-  function getBody(nodeId) {
-    return nodeBodies[nodeId];
-  }
-
-  function listenToGraphEvents() {
-    graph.on('changed', onGraphChanged);
-  }
-
-  function onGraphChanged(changes) {
-    for (var i = 0; i < changes.length; ++i) {
-      var change = changes[i];
-      if (change.changeType === 'add') {
-        if (change.node) {
-          initBody(change.node.id);
-        }
-        if (change.link) {
-          initLink(change.link);
-        }
-      } else if (change.changeType === 'remove') {
-        if (change.node) {
-          releaseNode(change.node);
-        }
-        if (change.link) {
-          releaseLink(change.link);
-        }
-      }
-    }
-  }
-
-  function initPhysics() {
-    graph.forEachNode(function (node) {
-      initBody(node.id);
-    });
-    graph.forEachLink(initLink);
-  }
-
-  function initBody(nodeId) {
-    var body = nodeBodies[nodeId];
-    if (!body) {
-      var node = graph.getNode(nodeId);
-      if (!node) {
-        throw new Error('initBody() was called with unknown node id');
-      }
-
-      var pos = node.position;
-      if (!pos) {
-        var neighbors = getNeighborBodies(node);
-        pos = physicsSimulator.getBestNewBodyPosition(neighbors);
-      }
-
-      body = physicsSimulator.addBodyAt(pos);
-
-      nodeBodies[nodeId] = body;
-      updateBodyMass(nodeId);
-
-      if (isNodeOriginallyPinned(node)) {
-        body.isPinned = true;
-      }
-    }
-  }
-
-  function releaseNode(node) {
-    var nodeId = node.id;
-    var body = nodeBodies[nodeId];
-    if (body) {
-      nodeBodies[nodeId] = null;
-      delete nodeBodies[nodeId];
-
-      physicsSimulator.removeBody(body);
-    }
-  }
-
-  function initLink(link) {
-    updateBodyMass(link.fromId);
-    updateBodyMass(link.toId);
-
-    var fromBody = nodeBodies[link.fromId],
-        toBody  = nodeBodies[link.toId],
-        spring = physicsSimulator.addSpring(fromBody, toBody, link.length);
-
-    springTransform(link, spring);
-
-    springs[link.id] = spring;
-  }
-
-  function releaseLink(link) {
-    var spring = springs[link.id];
-    if (spring) {
-      var from = graph.getNode(link.fromId),
-          to = graph.getNode(link.toId);
-
-      if (from) updateBodyMass(from.id);
-      if (to) updateBodyMass(to.id);
-
-      delete springs[link.id];
-
-      physicsSimulator.removeSpring(spring);
-    }
-  }
-
-  function getNeighborBodies(node) {
-    // TODO: Could probably be done better on memory
-    var neighbors = [];
-    if (!node.links) {
-      return neighbors;
-    }
-    var maxNeighbors = Math.min(node.links.length, 2);
-    for (var i = 0; i < maxNeighbors; ++i) {
-      var link = node.links[i];
-      var otherBody = link.fromId !== node.id ? nodeBodies[link.fromId] : nodeBodies[link.toId];
-      if (otherBody && otherBody.pos) {
-        neighbors.push(otherBody);
-      }
-    }
-
-    return neighbors;
-  }
-
-  function updateBodyMass(nodeId) {
-    var body = nodeBodies[nodeId];
-    body.mass = nodeMass(nodeId);
-  }
-
-  /**
-   * Checks whether graph node has in its settings pinned attribute,
-   * which means layout algorithm cannot move it. Node can be preconfigured
-   * as pinned, if it has "isPinned" attribute, or when node.data has it.
-   *
-   * @param {Object} node a graph node to check
-   * @return {Boolean} true if node should be treated as pinned; false otherwise.
-   */
-  function isNodeOriginallyPinned(node) {
-    return (node && (node.isPinned || (node.data && node.data.isPinned)));
-  }
-
-  function getInitializedBody(nodeId) {
-    var body = nodeBodies[nodeId];
-    if (!body) {
-      initBody(nodeId);
-      body = nodeBodies[nodeId];
-    }
-    return body;
-  }
-
-  /**
-   * Calculates mass of a body, which corresponds to node with given id.
-   *
-   * @param {String|Number} nodeId identifier of a node, for which body mass needs to be calculated
-   * @returns {Number} recommended mass of the body;
-   */
-  function nodeMass(nodeId) {
-    return 1 + graph.getLinks(nodeId).length / 3.0;
+function Vector2d(x, y) {
+  if (x && typeof x !== 'number') {
+    // could be another vector
+    this.x = typeof x.x === 'number' ? x.x : 0;
+    this.y = typeof x.y === 'number' ? x.y : 0;
+  } else {
+    this.x = typeof x === 'number' ? x : 0;
+    this.y = typeof y === 'number' ? y : 0;
   }
 }
 
-function noop() { }
+Vector2d.prototype.reset = function () {
+  this.x = this.y = 0;
+};
 
-},{"ngraph.physics.simulator":57}],57:[function(require,module,exports){
+function Body3d(x, y, z) {
+  this.pos = new Vector3d(x, y, z);
+  this.prevPos = new Vector3d(x, y, z);
+  this.force = new Vector3d();
+  this.velocity = new Vector3d();
+  this.mass = 1;
+}
+
+Body3d.prototype.setPosition = function (x, y, z) {
+  this.prevPos.x = this.pos.x = x;
+  this.prevPos.y = this.pos.y = y;
+  this.prevPos.z = this.pos.z = z;
+};
+
+function Vector3d(x, y, z) {
+  if (x && typeof x !== 'number') {
+    // could be another vector
+    this.x = typeof x.x === 'number' ? x.x : 0;
+    this.y = typeof x.y === 'number' ? x.y : 0;
+    this.z = typeof x.z === 'number' ? x.z : 0;
+  } else {
+    this.x = typeof x === 'number' ? x : 0;
+    this.y = typeof y === 'number' ? y : 0;
+    this.z = typeof z === 'number' ? z : 0;
+  }
+};
+
+Vector3d.prototype.reset = function () {
+  this.x = this.y = this.z = 0;
+};
+
+},{}],57:[function(require,module,exports){
 /**
  * Manages a simulation of physical forces acting on bodies and springs.
  */
@@ -7517,6 +7562,7 @@ function physicsSimulator(settings) {
   var Spring = require('./lib/spring');
   var expose = require('ngraph.expose');
   var merge = require('ngraph.merge');
+  var eventify = require('ngraph.events');
 
   settings = merge(settings, {
       /**
@@ -7575,6 +7621,9 @@ function physicsSimulator(settings) {
       springForce = createSpringForce(settings),
       dragForce = createDragForce(settings);
 
+  var totalMovement = 0; // how much movement we made on last step
+  var lastStable = false; // indicates whether system was stable on last step() call
+
   var publicApi = {
     /**
      * Array of bodies, registered with current simulator
@@ -7604,11 +7653,17 @@ function physicsSimulator(settings) {
      */
     step: function () {
       accumulateForces();
-      var totalMovement = integrate(bodies, settings.timeStep);
+      totalMovement = integrate(bodies, settings.timeStep);
 
       bounds.update();
+      var stableNow = totalMovement < settings.stableThreshold;
+      if (lastStable !== stableNow) {
+        publicApi.fire('stable', stableNow);
+      }
 
-      return totalMovement < settings.stableThreshold;
+      lastStable = stableNow;
+
+      return stableNow;
     },
 
     /**
@@ -7687,6 +7742,13 @@ function physicsSimulator(settings) {
     },
 
     /**
+     * Returns amount of movement performed on last step() call
+     */
+    getTotalMovement: function () {
+      return totalMovement;
+    },
+
+    /**
      * Removes spring from the system
      *
      * @param {Object} spring to remove. Spring is an object returned by addSpring
@@ -7736,6 +7798,7 @@ function physicsSimulator(settings) {
 
   // allow settings modification via public API:
   expose(settings, publicApi);
+  eventify(publicApi);
 
   return publicApi;
 
@@ -7749,10 +7812,14 @@ function physicsSimulator(settings) {
       quadTree.insertBodies(bodies); // performance: O(n * log n)
       while (i--) {
         body = bodies[i];
-        body.force.reset();
+        // If body is pinned there is no point updating its forces - it should
+        // never move:
+        if (!body.isPinned) {
+          body.force.reset();
 
-        quadTree.updateBodyForce(body);
-        dragForce.update(body);
+          quadTree.updateBodyForce(body);
+          dragForce.update(body);
+        }
       }
     }
 
@@ -7763,7 +7830,7 @@ function physicsSimulator(settings) {
   }
 };
 
-},{"./lib/bounds":58,"./lib/createBody":59,"./lib/dragForce":60,"./lib/eulerIntegrator":61,"./lib/spring":62,"./lib/springForce":63,"ngraph.expose":55,"ngraph.merge":68,"ngraph.quadtreebh":64}],58:[function(require,module,exports){
+},{"./lib/bounds":58,"./lib/createBody":59,"./lib/dragForce":60,"./lib/eulerIntegrator":61,"./lib/spring":62,"./lib/springForce":63,"ngraph.events":44,"ngraph.expose":45,"ngraph.merge":55,"ngraph.quadtreebh":64}],58:[function(require,module,exports){
 module.exports = function (bodies, settings) {
   var random = require('ngraph.random').random(42);
   var boundingBox =  { x1: 0, y1: 0, x2: 0, y2: 0 };
@@ -7845,14 +7912,14 @@ module.exports = function (bodies, settings) {
   }
 }
 
-},{"ngraph.random":74}],59:[function(require,module,exports){
+},{"ngraph.random":72}],59:[function(require,module,exports){
 var physics = require('ngraph.physics.primitives');
 
 module.exports = function(pos) {
   return new physics.Body(pos);
 }
 
-},{"ngraph.physics.primitives":69}],60:[function(require,module,exports){
+},{"ngraph.physics.primitives":56}],60:[function(require,module,exports){
 /**
  * Represents drag force, which reduces force value on each step by given
  * coefficient.
@@ -7881,7 +7948,7 @@ module.exports = function (options) {
   return api;
 };
 
-},{"ngraph.expose":55,"ngraph.merge":68}],61:[function(require,module,exports){
+},{"ngraph.expose":45,"ngraph.merge":55}],61:[function(require,module,exports){
 /**
  * Performs forces integration, using given timestep. Uses Euler method to solve
  * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
@@ -7896,6 +7963,10 @@ function integrate(bodies, timeStep) {
       dy = 0, ty = 0,
       i,
       max = bodies.length;
+
+  if (max === 0) {
+    return 0;
+  }
 
   for (i = 0; i < max; ++i) {
     var body = bodies[i],
@@ -7921,7 +7992,7 @@ function integrate(bodies, timeStep) {
     tx += Math.abs(dx); ty += Math.abs(dy);
   }
 
-  return (tx * tx + ty * ty)/bodies.length;
+  return (tx * tx + ty * ty)/max;
 }
 
 },{}],62:[function(require,module,exports){
@@ -7992,7 +8063,7 @@ module.exports = function (options) {
   return api;
 }
 
-},{"ngraph.expose":55,"ngraph.merge":68,"ngraph.random":74}],64:[function(require,module,exports){
+},{"ngraph.expose":45,"ngraph.merge":55,"ngraph.random":72}],64:[function(require,module,exports){
 /**
  * This is Barnes Hut simulation algorithm for 2d case. Implementation
  * is highly optimized (avoids recusion and gc pressure)
@@ -8318,7 +8389,7 @@ function setChild(node, idx, child) {
   else if (idx === 3) node.quad3 = child;
 }
 
-},{"./insertStack":65,"./isSamePosition":66,"./node":67,"ngraph.random":74}],65:[function(require,module,exports){
+},{"./insertStack":65,"./isSamePosition":66,"./node":67,"ngraph.random":72}],65:[function(require,module,exports){
 module.exports = InsertStack;
 
 /**
@@ -8403,106 +8474,6 @@ module.exports = function Node() {
 };
 
 },{}],68:[function(require,module,exports){
-module.exports = merge;
-
-/**
- * Augments `target` with properties in `options`. Does not override
- * target's properties if they are defined and matches expected type in 
- * options
- *
- * @returns {Object} merged object
- */
-function merge(target, options) {
-  var key;
-  if (!target) { target = {}; }
-  if (options) {
-    for (key in options) {
-      if (options.hasOwnProperty(key)) {
-        var targetHasIt = target.hasOwnProperty(key),
-            optionsValueType = typeof options[key],
-            shouldReplace = !targetHasIt || (typeof target[key] !== optionsValueType);
-
-        if (shouldReplace) {
-          target[key] = options[key];
-        } else if (optionsValueType === 'object') {
-          // go deep, don't care about loops here, we are simple API!:
-          target[key] = merge(target[key], options[key]);
-        }
-      }
-    }
-  }
-
-  return target;
-}
-
-},{}],69:[function(require,module,exports){
-module.exports = {
-  Body: Body,
-  Vector2d: Vector2d,
-  Body3d: Body3d,
-  Vector3d: Vector3d
-};
-
-function Body(x, y) {
-  this.pos = new Vector2d(x, y);
-  this.prevPos = new Vector2d(x, y);
-  this.force = new Vector2d();
-  this.velocity = new Vector2d();
-  this.mass = 1;
-}
-
-Body.prototype.setPosition = function (x, y) {
-  this.prevPos.x = this.pos.x = x;
-  this.prevPos.y = this.pos.y = y;
-};
-
-function Vector2d(x, y) {
-  if (x && typeof x !== 'number') {
-    // could be another vector
-    this.x = typeof x.x === 'number' ? x.x : 0;
-    this.y = typeof x.y === 'number' ? x.y : 0;
-  } else {
-    this.x = typeof x === 'number' ? x : 0;
-    this.y = typeof y === 'number' ? y : 0;
-  }
-}
-
-Vector2d.prototype.reset = function () {
-  this.x = this.y = 0;
-};
-
-function Body3d(x, y, z) {
-  this.pos = new Vector3d(x, y, z);
-  this.prevPos = new Vector3d(x, y, z);
-  this.force = new Vector3d();
-  this.velocity = new Vector3d();
-  this.mass = 1;
-}
-
-Body3d.prototype.setPosition = function (x, y, z) {
-  this.prevPos.x = this.pos.x = x;
-  this.prevPos.y = this.pos.y = y;
-  this.prevPos.z = this.pos.z = z;
-};
-
-function Vector3d(x, y, z) {
-  if (x && typeof x !== 'number') {
-    // could be another vector
-    this.x = typeof x.x === 'number' ? x.x : 0;
-    this.y = typeof x.y === 'number' ? x.y : 0;
-    this.z = typeof x.z === 'number' ? x.z : 0;
-  } else {
-    this.x = typeof x === 'number' ? x : 0;
-    this.y = typeof y === 'number' ? y : 0;
-    this.z = typeof z === 'number' ? z : 0;
-  }
-};
-
-Vector3d.prototype.reset = function () {
-  this.x = this.y = this.z = 0;
-};
-
-},{}],70:[function(require,module,exports){
 /**
  * This is Barnes Hut simulation algorithm for 3d case. Implementation
  * is highly optimized (avoids recusion and gc pressure)
@@ -8897,7 +8868,7 @@ function setChild(node, idx, child) {
   else if (idx === 7) node.quad7 = child;
 }
 
-},{"./insertStack":71,"./isSamePosition":72,"./node":73,"ngraph.random":74}],71:[function(require,module,exports){
+},{"./insertStack":69,"./isSamePosition":70,"./node":71,"ngraph.random":72}],69:[function(require,module,exports){
 module.exports = InsertStack;
 
 /**
@@ -8941,7 +8912,7 @@ function InsertStackElement(node, body) {
     this.body = body; // physical body which needs to be inserted to node
 }
 
-},{}],72:[function(require,module,exports){
+},{}],70:[function(require,module,exports){
 module.exports = function isSamePosition(point1, point2) {
     var dx = Math.abs(point1.x - point2.x);
     var dy = Math.abs(point1.y - point2.y);
@@ -8950,7 +8921,7 @@ module.exports = function isSamePosition(point1, point2) {
     return (dx < 1e-8 && dy < 1e-8 && dz < 1e-8);
 };
 
-},{}],73:[function(require,module,exports){
+},{}],71:[function(require,module,exports){
 /**
  * Internal data structure to represent 3D QuadTree node
  */
@@ -8994,9 +8965,248 @@ module.exports = function Node() {
   this.back = 0;
 };
 
-},{}],74:[function(require,module,exports){
-arguments[4][47][0].apply(exports,arguments)
-},{"dup":47}],75:[function(require,module,exports){
+},{}],72:[function(require,module,exports){
+module.exports = {
+  random: random,
+  randomIterator: randomIterator
+};
+
+/**
+ * Creates seeded PRNG with two methods:
+ *   next() and nextDouble()
+ */
+function random(inputSeed) {
+  var seed = typeof inputSeed === 'number' ? inputSeed : (+ new Date());
+  var randomFunc = function() {
+      // Robert Jenkins' 32 bit integer hash function.
+      seed = ((seed + 0x7ed55d16) + (seed << 12))  & 0xffffffff;
+      seed = ((seed ^ 0xc761c23c) ^ (seed >>> 19)) & 0xffffffff;
+      seed = ((seed + 0x165667b1) + (seed << 5))   & 0xffffffff;
+      seed = ((seed + 0xd3a2646c) ^ (seed << 9))   & 0xffffffff;
+      seed = ((seed + 0xfd7046c5) + (seed << 3))   & 0xffffffff;
+      seed = ((seed ^ 0xb55a4f09) ^ (seed >>> 16)) & 0xffffffff;
+      return (seed & 0xfffffff) / 0x10000000;
+  };
+
+  return {
+      /**
+       * Generates random integer number in the range from 0 (inclusive) to maxValue (exclusive)
+       *
+       * @param maxValue Number REQUIRED. Ommitting this number will result in NaN values from PRNG.
+       */
+      next : function (maxValue) {
+          return Math.floor(randomFunc() * maxValue);
+      },
+
+      /**
+       * Generates random double number in the range from 0 (inclusive) to 1 (exclusive)
+       * This function is the same as Math.random() (except that it could be seeded)
+       */
+      nextDouble : function () {
+          return randomFunc();
+      }
+  };
+}
+
+/*
+ * Creates iterator over array, which returns items of array in random order
+ * Time complexity is guaranteed to be O(n);
+ */
+function randomIterator(array, customRandom) {
+    var localRandom = customRandom || random();
+    if (typeof localRandom.next !== 'function') {
+      throw new Error('customRandom does not match expected API: next() function is missing');
+    }
+
+    return {
+        forEach : function (callback) {
+            var i, j, t;
+            for (i = array.length - 1; i > 0; --i) {
+                j = localRandom.next(i + 1); // i inclusive
+                t = array[j];
+                array[j] = array[i];
+                array[i] = t;
+
+                callback(t);
+            }
+
+            if (array.length) {
+                callback(array[0]);
+            }
+        },
+
+        /**
+         * Shuffles array randomly, in place.
+         */
+        shuffle : function () {
+            var i, j, t;
+            for (i = array.length - 1; i > 0; --i) {
+                j = localRandom.next(i + 1); // i inclusive
+                t = array[j];
+                array[j] = array[i];
+                array[i] = t;
+            }
+
+            return array;
+        }
+    };
+}
+
+},{}],73:[function(require,module,exports){
+/**
+ * Creates a force based layout that can be switched between 3d and 2d modes
+ * Layout is used by ngraph.pixel
+ *
+ * @param {ngraph.graph} graph instance that needs to be laid out
+ * @param {object} options - configures current layout.
+ * @returns {ojbect} api to operate with current layout. Only two methods required
+ * to exist by ngraph.pixel: `step()` and `getNodePosition()`.
+ */
+var eventify = require('ngraph.events');
+var layout3d = require('ngraph.forcelayout3d');
+var layout2d = layout3d.get2dLayout;
+
+module.exports = createLayout;
+
+function createLayout(graph, options) {
+  options = options || {};
+
+  /**
+   * Should the graph be rendered in 3d space? True by default
+   */
+  options.is3d = options.is3d === undefined ? true : options.is3d;
+
+  var is3d = options.is3d;
+  var layout = is3d ? layout3d(graph, options.physics) : layout2d(graph, options.physics);
+
+  var api = {
+    ////////////////////////////////////////////////////////////////////////////
+    // The following two methods are required by ngraph.pixel to be implemented
+    // by all layout providers
+    ////////////////////////////////////////////////////////////////////////////
+
+    /**
+     * Called by `ngraph.pixel` to perform one step. Required to be provided by
+     * all layout interfaces.
+     */
+    step: layout.step,
+
+    /**
+     * Gets position of a given node by its identifier. Required.
+     *
+     * @param {string} nodeId identifier of a node in question.
+     * @returns {object} {x: number, y: number, z: number} coordinates of a node.
+     */
+    getNodePosition: layout.getNodePosition,
+
+    ////////////////////////////////////////////////////////////////////////////
+    // Methods below are not required by ngraph.pixel, and are specific to the
+    // current layout implementation
+    ////////////////////////////////////////////////////////////////////////////
+
+    /**
+     * Sets position for a given node by its identifier.
+     *
+     * @param {string} nodeId identifier of a node that we want to modify
+     * @param {number} x coordinate of a node
+     * @param {number} y coordinate of a node
+     * @param {number} z coordinate of a node
+     */
+    setNodePosition: layout.setNodePosition,
+
+    /**
+     * Toggle rendering mode between 2d and 3d.
+     *
+     * @param {boolean+} newMode if set to true, the renderer will switch to 3d
+     * rendering mode. If set to false, the renderer will switch to 2d mode.
+     * Finally if this argument is not defined, then current rendering mode is
+     * returned.
+     */
+    is3d: mode3d,
+
+    /**
+     * Gets force based simulator of the current layout
+     */
+    simulator: layout.simulator,
+
+    /**
+     * Toggle node pinning. If node is pinned the layout algorithm is not allowed
+     * to change its position.
+     *
+     * @param {string} nodeId identifier of a node to work with;
+     * @param {boolean+} isPinned if specified then the `nodeId` pinning attribute
+     * is set to the to the value of this argument; Otherwise this method returns
+     * current pinning mode of the node.
+     */
+    pinNode: pinNode
+  };
+
+  eventify(api);
+
+  return api;
+
+  function mode3d(newMode) {
+    if (newMode === undefined) {
+      return is3d;
+    }
+    if (newMode !== is3d) {
+      toggleLayout();
+    }
+    return api;
+  }
+
+  function toggleLayout() {
+    var idx = 0;
+    var oldLayout = layout;
+    layout.dispose();
+    is3d = !is3d;
+    var physics = copyPhysicsSettings(layout.simulator);
+
+    if (is3d) {
+      layout = layout3d(graph, physics);
+    } else {
+      layout = layout2d(graph, physics);
+    }
+    graph.forEachNode(initLayout);
+    api.step = layout.step;
+    api.setNodePosition = layout.setNodePosition;
+    api.getNodePosition = layout.getNodePosition;
+    api.simulator = layout.simulator;
+
+    api.fire('reset');
+
+    function initLayout(node) {
+      var pos = oldLayout.getNodePosition(node.id);
+      // we need to bump 3d positions, so that forces are disturbed:
+      if (is3d) pos.z = (idx % 2 === 0) ? -1 : 1;
+      else pos.z = 0;
+      layout.setNodePosition(node.id, pos.x, pos.y, pos.z);
+      idx += 1;
+    }
+  }
+
+  function pinNode(nodeId, isPinned) {
+    var node = graph.getNode(nodeId);
+    if (!node) throw new Error('Could not find node in the graph. Node Id: ' + nodeId);
+    if (isPinned === undefined) {
+      return layout.isNodePinned(node);
+    }
+    layout.pinNode(node, isPinned);
+  }
+
+  function copyPhysicsSettings(simulator) {
+    return {
+      springLength: simulator.springLength(),
+      springCoeff: simulator.springCoeff(),
+      gravity: simulator.gravity(),
+      theta: simulator.theta(),
+      dragCoeff: simulator.dragCoeff(),
+      timeStep: simulator.timeStep()
+    };
+  }
+}
+
+},{"ngraph.events":44,"ngraph.forcelayout3d":47}],74:[function(require,module,exports){
 /**
  * @author James Baicoianu / http://www.baicoianu.com/
  * Source: https://github.com/mrdoob/three.js/blob/master/examples/js/controls/FlyControls.js
@@ -9274,7 +9484,7 @@ function fly(camera, domElement, THREE) {
   }
 }
 
-},{"./keymap.js":76,"ngraph.events":44}],76:[function(require,module,exports){
+},{"./keymap.js":75,"ngraph.events":44}],75:[function(require,module,exports){
 /**
  * Defines default key bindings for the controls
  */
@@ -9297,7 +9507,7 @@ function createKeyMap() {
   };
 }
 
-},{}],77:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
 var self = self || {};// File:src/Three.js
 
 /**
@@ -45486,7 +45696,7 @@ if (typeof exports !== 'undefined') {
   this['THREE'] = THREE;
 }
 
-},{}],78:[function(require,module,exports){
+},{}],77:[function(require,module,exports){
 /**
  * This file contains all possible configuration optins for the renderer
  */
@@ -45521,10 +45731,28 @@ function validateOptions(options) {
    */
   options.createLayout = typeof options.createLayout === 'function' ? options.createLayout : createLayout;
 
+  /**
+   * Experimental API: How link should be rendered?
+   */
+  options.link = typeof options.link === 'function' ? options.link : defaultLink;
+
+  /**
+   * Experimental API: How node should be rendered?
+   */
+  options.node = typeof options.node === 'function' ? options.node : defaultNode;
+
   return options;
 }
 
-},{"pixel.layout":48}],79:[function(require,module,exports){
+function defaultNode(/* node */) {
+  return { size: 20, color: 0xFF0894 };
+}
+
+function defaultLink(/* link */) {
+  return { fromColor: 0xFFFFFF,  toColor: 0xFFFFFF };
+}
+
+},{"pixel.layout":73}],78:[function(require,module,exports){
 module.exports = [
 '.ngraph-tooltip {',
 '  position: absolute;',
