@@ -155,6 +155,7 @@ function pixel(graph, options) {
   var tooltipView = createTooltipView(container);
 
   var cameraControls = options.cameraControls;
+  
   init();
   run();
   focus();
@@ -320,7 +321,7 @@ function pixel(graph, options) {
     input.on('nodeclick', passthrough('nodeclick'));
     input.on('nodedblclick', passthrough('nodedblclick'));
 
-    if (cameraControls) cameraControls.init();
+    if (cameraControls) cameraControls.init(camera, THREE);
     // cameraControls = new orbitControls(camera, document.getElementsByTagName('canvas')[0]);
     // cameraControls.autoRotate = true;
     // cameraControls.zoomSpeed = 1;
@@ -396,7 +397,7 @@ function pixel(graph, options) {
   }
 
   function stable(stableValue) {
-    if (stableValue === undefined) return isStable;
+    if (stableValue === undefined) return isStable;
     isStable = stableValue;
     api.fire('stable', isStable);
   }
