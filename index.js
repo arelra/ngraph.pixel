@@ -17,7 +17,6 @@ var createAutoFit = require('./lib/autoFit.js');
 var createInput = require('./lib/input.js');
 var validateOptions = require('./options.js');
 var flyTo = require('./lib/flyTo.js');
-// var orbitControls = require('three-orbit-controls')(THREE)
 
 var makeActive = require('./lib/makeActive.js');
 
@@ -155,7 +154,7 @@ function pixel(graph, options) {
   var nodes, edges;
   var tooltipView = createTooltipView(container);
 
-  // var cameraControls;
+  var cameraControls = options.cameraControls;
   init();
   run();
   focus();
@@ -207,7 +206,7 @@ function pixel(graph, options) {
       input.adjustSpeed(autoFitController.lastRadius());
     }
 
-    // cameraControls.update();
+    if (cameraControls) cameraControls.update();
 
     renderer.render(scene, camera);
   }
@@ -321,7 +320,7 @@ function pixel(graph, options) {
     input.on('nodeclick', passthrough('nodeclick'));
     input.on('nodedblclick', passthrough('nodedblclick'));
 
-    // TODO make this configurable to swap in different controls
+    if (cameraControls) cameraControls.init();
     // cameraControls = new orbitControls(camera, document.getElementsByTagName('canvas')[0]);
     // cameraControls.autoRotate = true;
     // cameraControls.zoomSpeed = 1;
